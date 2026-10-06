@@ -12,6 +12,7 @@ from app.orchestrator.best_of import BestOfSelector
 from app.orchestrator.engine import Orchestrator
 from app.orchestrator.state import NodeId
 from app.storage.file_store import FileStore
+from app.storage.package import application_package
 from app.validators.artifacts import validate_batch_smoke
 
 
@@ -38,6 +39,10 @@ async def create_batch(file: UploadFile = File(...), mode: str = Form("auto")) -
     content = await file.read()
     if not content.strip():
         raise HTTPException(status_code=400, detail={"message": "Uploaded specification is empty"})
+    try:
+        content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(400, detail={"message": "Specification must be UTF-8 encoded"}) from exc
     state = orchestrator.create_batch_from_bytes(filename=file.filename, content=content, mode=mode)  # type: ignore[arg-type]
     return {"batch_id": state.batch_id, "state": state.model_dump(mode="json")}
 
@@ -45,7 +50,7 @@ async def create_batch(file: UploadFile = File(...), mode: str = Form("auto")) -
 @app.post("/api/v1/batches/{batch_id}/run", status_code=202)
 def run_batch(batch_id: str, background_tasks: BackgroundTasks) -> dict[str, str]:
     _load_state_or_404(batch_id)
-    background_tasks.add_task(orchestrator.run_batch, batch_id)
+    _schedule(background_tasks, "run", batch_id)
     return {"batch_id": batch_id, "status": "accepted"}
 
 
@@ -73,7 +78,10 @@ def get_artifacts(batch_id: str) -> list[dict[str, str]]:
 @app.get("/api/v1/batches/{batch_id}/download")
 def download_artifact(batch_id: str, path: str) -> FileResponse:
     _load_state_or_404(batch_id)
-    target = store.resolve(path)
+    try:
+        target = store.resolve(path)
+    except ValueError as exc:
+        raise HTTPException(400, detail={"message": str(exc)}) from exc
     batch_root = store.batch_dir(batch_id).resolve()
     if batch_root not in target.parents or not target.is_file():
         raise HTTPException(status_code=404, detail={"message": "Artifact not found"})
@@ -87,14 +95,14 @@ def advance_batch(batch_id: str, background_tasks: BackgroundTasks) -> dict[str,
         raise HTTPException(status_code=400, detail={"message": "advance is only available for manual mode batches"})
     if state.status != "paused":
         raise HTTPException(status_code=400, detail={"message": f"Batch is not paused (status: {state.status})"})
-    background_tasks.add_task(orchestrator.advance_node, batch_id)
+    _schedule(background_tasks, "advance", batch_id)
     return {"batch_id": batch_id, "node_id": state.current_node, "status": "accepted"}
 
 
 @app.post("/api/v1/batches/{batch_id}/retry/{node_id}", status_code=202)
 def retry_node(batch_id: str, node_id: NodeId, background_tasks: BackgroundTasks) -> dict[str, str]:
     _load_state_or_404(batch_id)
-    background_tasks.add_task(orchestrator.retry_node, batch_id, node_id)
+    _schedule(background_tasks, "retry", batch_id, node_id)
     return {"batch_id": batch_id, "node_id": node_id, "status": "accepted"}
 
 
@@ -103,7 +111,9 @@ def validate(payload: dict[str, str]) -> dict[str, object]:
     batch_id = payload.get("batch_id")
     if not batch_id:
         raise HTTPException(status_code=400, detail={"message": "batch_id is required"})
-    _load_state_or_404(batch_id)
+    state = _load_state_or_404(batch_id)
+    if state.status in {"queued", "running", "paused"}:
+        raise HTTPException(409, detail={"message": "Finish the pipeline before validation"})
     try:
         return {"batch_id": batch_id, "validation": validate_batch_smoke(store, batch_id)}
     except Exception as exc:
@@ -163,7 +173,7 @@ def best_of_batches(payload: BestOfRequest, background_tasks: BackgroundTasks) -
         )
 
     new_state = selector.create_seeded_batch(winner["batch_id"])
-    background_tasks.add_task(orchestrator.run_batch, new_state.batch_id)
+    _schedule(background_tasks, "run", new_state.batch_id)
 
     return {
         "new_batch_id": new_state.batch_id,
@@ -186,11 +196,7 @@ def package_batch(batch_id: str) -> StreamingResponse:
             status_code=404,
             detail={"message": "No generated package found — has the pipeline completed successfully?"},
         )
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fp in sorted(files):
-            zf.write(fp, fp.relative_to(out_dir).as_posix())
-    buf.seek(0)
+    buf = io.BytesIO(application_package(out_dir))
     return StreamingResponse(
         buf,
         media_type="application/zip",
@@ -203,3 +209,10 @@ def _load_state_or_404(batch_id: str):
         return store.load_state(batch_id)
     except Exception as exc:
         raise HTTPException(status_code=404, detail={"message": "Batch not found"}) from exc
+
+
+def _schedule(background_tasks, action, batch_id, *args):
+    try:
+        orchestrator.schedule(background_tasks, action, batch_id, *args)
+    except ValueError as exc:
+        raise HTTPException(409, detail={"message": str(exc)}) from exc

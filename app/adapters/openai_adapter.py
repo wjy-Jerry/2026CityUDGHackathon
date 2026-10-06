@@ -23,7 +23,7 @@ class OpenAIAdapter:
             try:
                 from openai import OpenAI
 
-                kwargs: dict[str, str] = {"api_key": self.settings.openai_api_key or ""}
+                kwargs: dict[str, Any] = {"api_key": self.settings.openai_api_key or "", "timeout": 60.0, "max_retries": 1}
                 if self.settings.openai_base_url:
                     kwargs["base_url"] = self.settings.openai_base_url
                 self._client = OpenAI(**kwargs)
@@ -175,11 +175,8 @@ class OpenAIAdapter:
                             "content": (
                                 "The previous JSON failed validation. Return a corrected JSON object only.\n"
                                 f"Validation error:\n{exc}\n\n"
-                                "Repair rules:\n"
-                                "- Every file content field must be a non-empty complete Python source string.\n"
-                                "- Do not include CSV, JSON, Markdown, binary, or data files in files[].\n"
-                                "- Only include project-relative .py paths under src/.\n"
-                                "- Always include non-empty src/__init__.py and src/api.py."
+                                "Follow the supplied schema exactly. Preserve all required fields and complete file contents."
+
                             ),
                         },
                     ]

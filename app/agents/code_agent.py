@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import shutil
+import json
+from html import escape
 from pathlib import Path
 from textwrap import dedent
 
@@ -51,7 +53,7 @@ DEFAULT_SCHEMAS: dict[str, list[str]] = {
         "reservation_id", "name", "employee_id", "mobile", "campus", "reservation_date", "plate_no", "status"
     ],
     "ketuo_reservation_archive.csv": ["reservation_id", "plate_no", "campus", "reserve_date", "status", "remark"],
-    "payment_records.csv": ["payment_id", "reservation_id", "plate_no", "amount", "status", "created_at"],
+    "payment_records.csv": ["payment_id", "reservation_id", "plate_no", "campus", "amount", "status", "created_at"],
     "internal_vehicle_archive.csv": ["plate_no", "owner", "remark"],
 }
 
@@ -128,6 +130,8 @@ from __future__ import annotations
 
 import re
 import uuid
+import threading
+from functools import wraps
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -140,8 +144,17 @@ DISABLED_MESSAGE = "当前园区暂不开放预约"
 PAYMENT_SUCCESS_MESSAGE = "缴费成功，离厂时无需支付"
 
 
+def synchronized(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 class ReservationService:
     def __init__(self, data_dir: Path | str = "data") -> None:
+        self._lock = threading.RLock()
         self.repository = CSVRepository(data_dir)
         self.repository.initialize()
         self.ensure_default_campus_configs()
@@ -167,6 +180,7 @@ class ReservationService:
     def list_reservations(self) -> list[dict[str, str]]:
         return self.repository.read_all("reservations.csv")
 
+    @synchronized
     def create_reservation(self, request: ReservationCreate) -> dict[str, object]:
         config = self._campus_config(request.campus)
         if not config or config.get("enabled", "").lower() != "true":
@@ -175,6 +189,8 @@ class ReservationService:
             return {"success": False, "message": "车牌号格式不正确", "reservation_id": None}
         if not self._within_next_seven_days(request.reservation_date):
             return {"success": False, "message": "预约日期必须在未来7天内", "reservation_id": None}
+        if self.repository.query("internal_vehicle_archive.csv", lambda row: row["plate_no"].strip().upper() == request.plate_no.strip().upper()):
+            return {"success": False, "message": "已有内部车辆档案，禁止重复预约", "reservation_id": None}
         if self._duplicate_plate(request.plate_no, request.reservation_date):
             return {"success": False, "message": "同一车牌同一天只能预约一个园区", "reservation_id": None}
         if self._active_count(request.campus, request.reservation_date) >= self._quota(config, request.reservation_date):
@@ -188,7 +204,7 @@ class ReservationService:
             "mobile": request.mobile,
             "campus": request.campus,
             "reservation_date": request.reservation_date.isoformat(),
-            "plate_no": request.plate_no.upper(),
+            "plate_no": request.plate_no.strip().upper(),
             "status": "success",
         }
         self.repository.append("reservations.csv", row)
@@ -196,15 +212,16 @@ class ReservationService:
             "ketuo_reservation_archive.csv",
             {
                 "reservation_id": reservation_id,
-                "plate_no": request.plate_no.upper(),
+                "plate_no": request.plate_no.strip().upper(),
                 "campus": request.campus,
                 "reserve_date": request.reservation_date.isoformat(),
-                "status": "success",
+                "status": "pending",
                 "remark": f"{request.name}/{request.employee_id}/{request.mobile}",
             },
         )
         return {"success": True, "message": "预约成功", "reservation_id": reservation_id}
 
+    @synchronized
     def cancel_reservation(self, reservation_id: str) -> dict[str, object]:
         matches = self.repository.query(
             "reservations.csv",
@@ -224,6 +241,7 @@ class ReservationService:
         )
         return {"success": True, "message": "取消成功", "reservation_id": reservation_id}
 
+    @synchronized
     def advance_payment(self, reservation_id: str) -> dict[str, object]:
         matches = self.repository.query(
             "reservations.csv",
@@ -232,6 +250,9 @@ class ReservationService:
         if not matches:
             return {"success": False, "message": "未找到可缴费的预约", "reservation_id": reservation_id}
         reservation = matches[0]
+        existing = self.repository.query("payment_records.csv", lambda row: row["reservation_id"] == reservation_id)
+        if existing:
+            return {"success": True, "message": PAYMENT_SUCCESS_MESSAGE, "reservation_id": reservation_id, "payment_id": existing[0]["payment_id"]}
         payment_id = uuid.uuid4().hex[:12]
         self.repository.append(
             "payment_records.csv",
@@ -239,6 +260,7 @@ class ReservationService:
                 "payment_id": payment_id,
                 "reservation_id": reservation_id,
                 "plate_no": reservation["plate_no"],
+                "campus": reservation["campus"],
                 "amount": "20.00",
                 "status": "success",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -250,6 +272,23 @@ class ReservationService:
             "reservation_id": reservation_id,
             "payment_id": payment_id,
         }
+
+    def availability(self, campus: str, reservation_date: date) -> dict[str, object]:
+        config = self._campus_config(campus)
+        if not config:
+            raise ValueError("Unknown campus")
+        quota = self._quota(config, reservation_date) if config["enabled"].lower() == "true" else 0
+        return {"campus": campus, "date": reservation_date.isoformat(),
+                "remaining": max(0, quota - self._active_count(campus, reservation_date)), "instruction": config["instruction"]}
+
+    @synchronized
+    def configure_campus(self, campus: str, weekday_quota: int, rest_day_quota: int, enabled: bool, instruction: str) -> dict[str, object]:
+        if not self._campus_config(campus):
+            raise ValueError("Unknown campus")
+        self.repository.update("campus_configs.csv", lambda row: row["campus"] == campus,
+                               {"weekday_quota": weekday_quota, "rest_day_quota": rest_day_quota,
+                                "enabled": str(enabled).lower(), "instruction": instruction})
+        return {"success": True}
 
     def set_campus_enabled(self, campus: str, enabled: bool) -> None:
         self.repository.update("campus_configs.csv", lambda row: row["campus"] == campus, {"enabled": str(enabled).lower()})
@@ -273,7 +312,7 @@ class ReservationService:
 
     def _duplicate_plate(self, plate_no: str, reservation_date: date) -> bool:
         day = reservation_date.isoformat()
-        plate = plate_no.upper()
+        plate = plate_no.strip().upper()
         return bool(
             self.repository.query(
                 "reservations.csv",
@@ -296,7 +335,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI
+from datetime import date
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.models import ReservationCreate
@@ -310,7 +352,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-service = ReservationService(Path("data"))
+service = ReservationService(Path(__file__).resolve().parents[1] / "data")
 
 
 @app.get("/health")
@@ -341,6 +383,31 @@ def cancel_reservation(reservation_id: str) -> dict[str, object]:
 @app.post("/reservations/{reservation_id}/pay")
 def advance_payment(reservation_id: str) -> dict[str, object]:
     return service.advance_payment(reservation_id)
+
+class CampusUpdate(BaseModel):
+    weekday_quota: int = Field(ge=0)
+    rest_day_quota: int = Field(ge=0)
+    enabled: bool
+    instruction: str = ""
+
+@app.get("/availability")
+def availability(campus: str, reservation_date: date):
+    try:
+        return service.availability(campus, reservation_date)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+@app.put("/campuses/{campus}")
+def configure(campus: str, request: CampusUpdate):
+    try:
+        return service.configure_campus(campus, **request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+frontend = Path(__file__).resolve().parents[1] / "frontend"
+if frontend.is_dir():
+    app.mount("/", StaticFiles(directory=frontend, html=True), name="frontend")
+
 ''',
 }
 
@@ -544,7 +611,8 @@ th, td {
 }
 ''',
     "app.js": r'''
-const apiBase = "http://127.0.0.1:8000";
+const apiBase = location.protocol === "file:" ? "http://127.0.0.1:8001" : location.origin;
+const escapeHtml = value => String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;", "'":"&#39;"}[c]));
 
 const healthStatus = document.querySelector("#healthStatus");
 const campusSelect = document.querySelector("#campusSelect");
@@ -566,7 +634,7 @@ async function request(path, options = {}) {
     ...options,
   });
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+    throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   }
   return response.json();
 }
@@ -593,12 +661,25 @@ async function loadCampuses() {
   for (const campus of campuses) {
     const option = document.createElement("option");
     option.value = campus.campus;
-    option.textContent = campus.campus;
+    option.textContent = ({Weifang:"潍坊",Qingdao:"青岛",Rongcheng:"荣成",Dongguan:"东莞"})[campus.campus] || campus.campus;
     option.dataset.instruction = campus.instruction || "";
     campusSelect.appendChild(option);
 
     const row = document.createElement("tr");
-    row.innerHTML = `<td>${campus.campus}</td><td>${campus.weekday_quota}</td><td>${campus.rest_day_quota}</td><td>${campus.enabled}</td><td>${campus.instruction}</td>`;
+    row.innerHTML = `<td>${campus.campus}</td><td>${campus.weekday_quota}</td><td>${campus.rest_day_quota}</td><td>${campus.enabled}</td><td>${escapeHtml(campus.instruction)}</td>`;
+    const edit = document.createElement("button");
+    edit.textContent = "配置";
+    edit.onclick = async () => {
+      const weekday = prompt("工作日配额", campus.weekday_quota);
+      if (weekday === null) return;
+      const rest = prompt("休息日配额", campus.rest_day_quota);
+      if (rest === null) return;
+      try {
+        await request(`/campuses/${campus.campus}`, {method:"PUT", body: JSON.stringify({weekday_quota:Number(weekday), rest_day_quota:Number(rest), enabled:confirm("开启预约？取消表示关闭"), instruction:campus.instruction})});
+        await loadCampuses(); await refreshAvailability();
+      } catch(error) { setMessage(error.message, false); }
+    };
+    const editCell = document.createElement("td"); editCell.appendChild(edit); row.appendChild(editCell);
     campusRows.appendChild(row);
   }
   updateInstruction();
@@ -618,7 +699,7 @@ async function loadReservations() {
       <td>${item.reservation_id}</td>
       <td>${item.campus}</td>
       <td>${item.reservation_date}</td>
-      <td>${item.plate_no}</td>
+      <td>${escapeHtml(item.plate_no)}</td>
       <td>${item.status}</td>
       <td>
         <button data-action="pay" data-id="${item.reservation_id}" type="button">提前缴费</button>
@@ -635,12 +716,21 @@ reservationForm.addEventListener("submit", async (event) => {
     const result = await request("/reservations", {method: "POST", body: JSON.stringify(payload)});
     setMessage(result.message, result.success);
     await loadReservations();
+    await refreshAvailability();
   } catch (error) {
     setMessage(`提交失败：${error.message}`, false);
   }
 });
 
-campusSelect.addEventListener("change", updateInstruction);
+async function refreshAvailability() {
+  if (!campusSelect.value || !reservationDate.value) return;
+  try {
+    const data = await request(`/availability?campus=${encodeURIComponent(campusSelect.value)}&reservation_date=${reservationDate.value}`);
+    campusInstruction.textContent = `${data.instruction} · 剩余可预约车位：${data.remaining}`;
+  } catch(error) { setMessage(error.message, false); }
+}
+campusSelect.addEventListener("change", () => {updateInstruction(); refreshAvailability();});
+reservationDate.addEventListener("change", refreshAvailability);
 
 document.querySelector("#refreshReservations").addEventListener("click", loadReservations);
 
@@ -650,14 +740,16 @@ reservationRows.addEventListener("click", async (event) => {
   const id = button.dataset.id;
   const action = button.dataset.action;
   const path = action === "pay" ? `/reservations/${id}/pay` : `/reservations/${id}/cancel`;
-  const result = await request(path, {method: "POST"});
-  setMessage(result.message, result.success);
-  await loadReservations();
+  try {
+    const result = await request(path, {method: "POST"});
+    setMessage(result.message, result.success);
+    await loadReservations(); await refreshAvailability();
+  } catch(error) { setMessage(error.message, false); }
 });
 
 setDefaultDate();
 loadHealth();
-loadCampuses().then(loadReservations).catch((error) => setMessage(`加载失败：${error.message}`, false));
+loadCampuses().then(async()=>{await loadReservations(); await refreshAvailability();}).catch((error) => setMessage(`加载失败：${error.message}`, false));
 ''',
 }
 
@@ -721,6 +813,9 @@ class CodeAgent(BaseAgent):
                 for path in sorted(frontend_snapshot_dir.rglob("*"))
                 if path.is_file()
             ]
+        self.store.write_text(out_root / "pytest.ini", "[pytest]\npythonpath = .\ntestpaths = tests/generated\n")
+        self.store.write_text(out_root / "requirements.txt", "fastapi>=0.111.0\nuvicorn>=0.30.0\npydantic>=2.7.0\nhttpx>=0.27.0\npytest>=8.2.0\npytest-cov>=5.0.0\n")
+        self.store.write_json(out_root / "code_manifest.json", code_manifest)
         (out_root / "README.md").write_text(self._readme(batch_id, code_manifest), encoding="utf-8")
 
         return [manifest_ref, *written_refs, *snapshot_refs, *frontend_snapshot_refs]
@@ -730,9 +825,9 @@ class CodeAgent(BaseAgent):
         spec_text = self.read_text(spec_path)
         overview = self._optional_batch_text(batch_id, "概要设计", "overview_design.md")
         manifest = self._optional_batch_text(batch_id, "概要设计", "design_manifest.json")
-        frontend_required = bool(manifest) and any(
+        frontend_required = bool(json.loads(manifest).get("frontend_requirements") or json.loads(manifest).get("pages")) or any(
             kw in (overview + manifest)
-            for kw in ("frontend_requirements", "pages", "Web", "B/S", "浏览器", "前端", "页面", "表单", "按钮", "后台")
+            for kw in ("Web", "B/S", "浏览器", "前端", "页面", "表单", "按钮", "后台")
         )
         frontend_instruction = (
             "IMPORTANT: The design mandates a frontend. You MUST generate frontend/index.html "
@@ -760,18 +855,33 @@ class CodeAgent(BaseAgent):
             "  business_rules: 完整的业务规则描述列表（每条为完整中文句子）\n"
             "  csv_tables: 所有 CSV 存储文件名列表\n"
             "  frontend_pages: [{path, name, purpose, controls:[str]}]，每个页面一条\n"
+            "  storage_contract: {module, service_attribute, factory, argument}; factory accepts data_dir for isolated tests\n"
             "  run_instructions: 本地启动所需的完整命令和 URL 列表\n\n"
             f"# 产品规格说明书（背景参考）\n{spec_text}\n\n"
             f"# 概要设计文档（主要权威输入）\n{overview}\n\n"
             f"# 设计清单 design_manifest.json\n{manifest}\n"
         )
+        repair = self.store.batch_dir(batch_id) / "repair_report.json"
+        if repair.is_file():
+            user += "\n# Structured repair feedback\n" + repair.read_text(encoding="utf-8")
         metadata = {"batch_id": batch_id, "node_id": "code"}
         try:
             return self.llm.generate_json(system=prompt, user=user, schema=CodeGenerationResult, metadata=metadata)
         except Exception:
             if self._strict_mode():
                 raise
-            return self._template_generation_result()
+            design = json.loads(manifest)
+            if design.get("generation_profile") != "vehicle":
+                from app.agents.fallback import generic_code
+                return CodeGenerationResult.model_validate(generic_code(design))
+            result = self._template_generation_result()
+            result.manifest["system_name"] = design["system_name"]
+            for file in result.files:
+                if file.path == "src/api.py":
+                    file.content = file.content.replace('title="Employee Temporary Vehicle Reservation System"', "title=" + repr(design["system_name"]))
+                elif file.path == "frontend/index.html":
+                    file.content = file.content.replace("员工临时车辆预约管理系统", escape(design["system_name"]))
+            return result
 
     def _strict_mode(self) -> bool:
         adapter_settings = getattr(self.llm, "settings", None)
@@ -784,6 +894,8 @@ class CodeAgent(BaseAgent):
         return path.read_text(encoding="utf-8")
 
     def _safe_generated_path(self, generated_path: str, base_dir: Path | None = None) -> Path:
+        if "\\" in generated_path:
+            raise ValueError("Generated paths must use POSIX separators")
         candidate = Path(generated_path)
         if candidate.is_absolute():
             raise ValueError(f"Generated path must be relative: {generated_path}")
@@ -793,6 +905,8 @@ class CodeAgent(BaseAgent):
             raise ValueError(f"Generated path must be under src/ or frontend/: {generated_path}")
         root = base_dir or self.store.root_dir
         target = (root / candidate).resolve()
+        if not target.is_relative_to(root.resolve()):
+            raise ValueError("Generated path escapes application root")
         allowed_root = (root / candidate.parts[0]).resolve()
         if target != allowed_root and allowed_root not in target.parents:
             raise ValueError(f"Generated path escapes {candidate.parts[0]}/: {generated_path}")
@@ -810,20 +924,20 @@ class CodeAgent(BaseAgent):
         lines = [
             f"# {name}",
             "",
-            "> 由 AI Agent 开发流水线自动生成。批次 ID: `{batch_id}`",
+            f"> 由 AI Agent 开发流水线自动生成。批次 ID: `{batch_id}`",
             "",
             "## 快速启动",
             "",
             "```bash",
-            "pip install fastapi uvicorn pydantic",
+            "pip install -r requirements.txt",
             f"{backend_cmd}",
             "```",
             "",
-            "后端文档：http://127.0.0.1:8000/docs",
+            "后端文档：访问启动命令对应的端口下的 /docs。",
             "",
         ]
         if has_frontend:
-            lines += ["## 前端", "", "直接用浏览器打开 `frontend/index.html`，无需额外服务。", ""]
+            lines += ["## 前端", "", "按 `code_manifest.json` 的运行指令访问前端。离线模板由后端同源提供，默认 http://127.0.0.1:8001 。", ""]
         lines += [
             "## 运行测试",
             "",
@@ -870,6 +984,12 @@ class CodeAgent(BaseAgent):
             manifest={
                 "system_name": "Employee Temporary Vehicle Reservation System",
                 "strategy": "template-fallback",
+                "limitations": ["No employee/admin authentication in offline template", "Calendar uses weekends, not statutory holiday calendars", "CSV is intended for single-process local demos"],
+                "storage_contract": {"module": "src.api", "service_attribute": "service", "factory": "src.services.ReservationService", "argument": "data_dir"},
+                "api_routes": [{"method": method, "path": path} for method, path in [
+                    ("GET", "/health"), ("GET", "/campuses"), ("GET", "/availability"), ("PUT", "/campuses/{campus}"),
+                    ("GET", "/reservations"), ("POST", "/reservations"),
+                    ("POST", "/reservations/{reservation_id}/cancel"), ("POST", "/reservations/{reservation_id}/pay")]],
                 "business_functions": ["campus configuration", "reservation", "cancellation", "advance payment", "query"],
                 "csv_tables": [
                     "campus_configs.csv",
@@ -894,8 +1014,8 @@ class CodeAgent(BaseAgent):
                     }
                 ],
                 "run_instructions": [
-                    "uvicorn src.api:app --reload",
-                    "open frontend/index.html in a browser",
+                    "uvicorn src.api:app --port 8001",
+                    "http://127.0.0.1:8001",
                 ],
             },
         )

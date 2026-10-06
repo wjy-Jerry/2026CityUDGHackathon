@@ -133,6 +133,65 @@ def test_cancellation_releases_quota(tmp_path):
     assert second["success"] is True
     ketuo = service.repository.read_all("ketuo_reservation_archive.csv")
     assert ketuo[0]["status"] == "cancelled"
+
+def test_internal_archive_plate_normalization_and_payment_idempotency(tmp_path):
+    service = ReservationService(tmp_path)
+    day = date.today() + timedelta(days=1)
+    service.repository.append('internal_vehicle_archive.csv', {'plate_no':'鲁A12345','owner':'Alice'})
+    assert not service.create_reservation(make_request(day))['success']
+    created = service.create_reservation(make_request(day, plate_no=' 鲁a54321 '))
+    assert created['success']
+    first = service.advance_payment(created['reservation_id'])
+    assert service.advance_payment(created['reservation_id'])['payment_id'] == first['payment_id']
+    assert len(service.repository.read_all('payment_records.csv')) == 1
+    assert service.repository.read_all('payment_records.csv')[0]['campus'] == 'Weifang'
+    assert not service.cancel_reservation('missing')['success']
+    assert not service.advance_payment('missing')['success']
+
+
+def test_availability_and_configuration_api(tmp_path, monkeypatch):
+    monkeypatch.setattr(business_api, 'service', ReservationService(tmp_path))
+    with TestClient(business_api.app) as client:
+        day = (date.today() + timedelta(days=1)).isoformat()
+        response = client.put('/campuses/Weifang', json={'weekday_quota':0,'rest_day_quota':0,'enabled':True,'instruction':'Closed quota'})
+        assert response.status_code == 200 and response.json()['success']
+        assert client.get('/availability', params={'campus':'Weifang','reservation_date':day}).json()['remaining'] == 0
+        assert client.get('/availability', params={'campus':'Unknown','reservation_date':day}).status_code == 404
+        assert client.put('/campuses/Unknown', json={'weekday_quota':1,'rest_day_quota':1,'enabled':True}).status_code == 404
+        assert client.put('/campuses/Weifang', json={'weekday_quota':-1,'rest_day_quota':1,'enabled':True}).status_code == 422
+        assert client.post('/reservations', json={}).status_code == 422
+
+
+def test_repository_invalid_table_and_field(tmp_path):
+    import pytest
+    repo = CSVRepository(tmp_path)
+    with pytest.raises(ValueError):
+        repo.read_all('unknown.csv')
+    repo.append('internal_vehicle_archive.csv', {'plate_no':'鲁A12345'})
+    with pytest.raises(ValueError):
+        repo.update('internal_vehicle_archive.csv', lambda row: True, {'unknown':'x'})
+    assert repo.update('internal_vehicle_archive.csv', lambda row: False, {'owner':'x'}) == 0
+
+
+def test_frontend_is_served_and_has_controls(tmp_path, monkeypatch):
+    monkeypatch.setattr(business_api, 'service', ReservationService(tmp_path))
+    with TestClient(business_api.app) as client:
+        response = client.get('/')
+        assert response.status_code == 200
+        assert '<form' in response.text and '<button' in response.text
+        assert client.get('/app.js').status_code == 200
+
+
+def test_concurrent_reservations_cannot_exceed_quota(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    service = ReservationService(tmp_path)
+    day = date.today() + timedelta(days=1)
+    service.repository.update('campus_configs.csv', lambda row: row['campus'] == 'Weifang', {'weekday_quota':1,'rest_day_quota':1})
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda plate: service.create_reservation(make_request(day, plate_no=plate)), ['鲁A12345','鲁A12346','鲁A12347']))
+    assert sum(result['success'] for result in results) == 1
+    assert len(service.repository.read_all('reservations.csv')) == 1
+
 '''
 
 
@@ -181,34 +240,23 @@ class TestAgent(BaseAgent):
 
     def _generate_tests(self, *, batch_id: str, spec_path: str) -> TestGenerationResult:
         prompt = self.load_prompt()
-        spec_text = self.read_text(spec_path)
         overview = self._optional_batch_text(batch_id, "概要设计", "overview_design.md")
         design_manifest = self._optional_batch_text(batch_id, "概要设计", "design_manifest.json")
         code_manifest = self._optional_batch_text(batch_id, "代码生成", "code_manifest.json")
+        if json.loads(code_manifest).get("strategy") == "generic-template-fallback":
+            from app.agents.fallback import GENERIC_TESTS
+            return TestGenerationResult(files=[GeneratedTestFile(path="tests/generated/test_records.py", content=GENERIC_TESTS)],
+                                        test_plan_markdown="# Test Plan\n\nRecord lifecycle, CSV persistence, invalid input and missing records.")
         if self._is_template_code_manifest(code_manifest):
             return self._template_generation_result()
         source_index = self._source_index(batch_id)
         user = (
-            "生成完整的、确定性的 pytest 测试套件，覆盖下方 code_manifest 中记录的至少 80% 的 API 路由和业务规则。\n"
-            "返回 JSON，不含 Markdown、不含 prose。每个测试文件路径必须在 tests/generated/ 下。\n"
-            "这是完整的替换测试套件，从零生成，不假设任何之前的测试存在。\n"
-            "所有测试函数必须：仅使用 tmp_path 和 FastAPI TestClient；无共享可变状态；可独立运行；可重复执行。\n"
-            "严禁调用外部 API、shell 命令、网络服务。\n"
-            "【重要】所有 import 路径、模块名、类名、函数名、字段名、错误消息必须与下方【实际生成的源代码】完全一致。\n"
-            "源代码中不存在的模块、类、端点、字段禁止出现在任何 import 或测试断言中。\n"
-            "若源代码中没有鉴权/角色权限逻辑，禁止生成任何权限相关测试（如 permission_error、not_logged_in 等）。\n"
-            "conftest.py（如生成）中只允许导入源代码中已确认存在的模块；不确定是否存在时不导入。\n\n"
-            "必须生成以下四个文件：\n"
-            "  tests/generated/test_api_routes.py — 仅测试 code_manifest 的 api_routes 中列出的路由，每条 × 正常路径 + error_cases\n"
-            "  tests/generated/test_business_rules.py — 仅测试源代码中已实现的业务规则 × 满足条件 + 违反条件\n"
-            "  tests/generated/test_storage.py — 成功写操作后验证 CSV 行内容正确（字段名取自源代码的 DEFAULT_SCHEMAS 或等效定义）\n"
-            "  tests/generated/test_frontend_contract.py — 前端文件存在性 + HTML 控件内容检查（不启动浏览器）\n\n"
-            "错误消息的预期值必须与源代码中的字符串字面量一致，不得从 design_manifest 或 overview_design 中臆测。\n\n"
-            f"# 产品规格说明书\n{spec_text}\n\n"
-            f"# 概要设计文档（overview_design.md）\n{overview}\n\n"
-            f"# 设计清单（design_manifest.json）\n{design_manifest}\n\n"
-            f"# 代码接口清单（code_manifest.json）\n{code_manifest}\n\n"
-            f"# 实际生成的源代码（测试的唯一权威依据，import 和断言必须与此完全一致）\n{source_index}\n"
+            "Generate isolated pytest tests from persisted design and interface metadata only. "
+            "Use storage_contract in code_manifest to instantiate the service with tmp_path; "
+            "do not guess imports or silently fall back to shared data. "
+            "Return JSON files and test_plan_markdown.\n"
+            f"# Design overview\n{overview}\n# Design manifest\n{design_manifest}\n"
+            f"# Code interface manifest\n{code_manifest}\n# Source file paths (no code text)\n{source_index}"
         )
         metadata = {"batch_id": batch_id, "node_id": "test"}
         try:
@@ -216,7 +264,7 @@ class TestAgent(BaseAgent):
         except Exception:
             if self._strict_mode():
                 raise
-            return self._template_generation_result()
+            raise RuntimeError("Cannot safely generate fallback tests for arbitrary LLM code; retry in LLM mode")
 
     def _strict_mode(self) -> bool:
         adapter_settings = getattr(self.llm, "settings", None)
@@ -241,24 +289,11 @@ class TestAgent(BaseAgent):
         src_dir = self.store.output_batch_dir(batch_id) / "src"
         if not src_dir.exists():
             src_dir = self.store.root_dir / "src"
-        CONTENT_FILES = {"api.py", "models.py", "services.py", "repository.py", "storage.py", "csv_repository.py"}
-        MAX_CHARS_PER_FILE = 5000
-        parts = []
-        for path in sorted(src_dir.rglob("*.py")):
-            relative = "src/" + path.relative_to(src_dir).as_posix()
-            if path.name in CONTENT_FILES:
-                try:
-                    content = path.read_text(encoding="utf-8")
-                    if len(content) > MAX_CHARS_PER_FILE:
-                        content = content[:MAX_CHARS_PER_FILE] + "\n# ... (truncated)"
-                    parts.append(f"### {relative}\n```python\n{content}\n```")
-                except Exception:
-                    parts.append(f"- {relative}")
-            else:
-                parts.append(f"- {relative}")
-        return "\n\n".join(parts)
+        return "\n".join("- src/" + path.relative_to(src_dir).as_posix() for path in sorted(src_dir.rglob("*.py")))
 
     def _safe_test_path(self, generated_path: str, base_dir: Path | None = None) -> Path:
+        if "\\" in generated_path:
+            raise ValueError("Generated paths must use POSIX separators")
         candidate = Path(generated_path)
         if candidate.is_absolute():
             raise ValueError(f"Generated path must be relative: {generated_path}")
@@ -268,6 +303,8 @@ class TestAgent(BaseAgent):
             raise ValueError(f"Generated test path must be under tests/generated/: {generated_path}")
         root = base_dir or self.store.root_dir
         target = (root / candidate).resolve()
+        if not target.is_relative_to(root.resolve()):
+            raise ValueError("Generated test path escapes application root")
         test_root = (root / "tests" / "generated").resolve()
         if target != test_root and test_root not in target.parents:
             raise ValueError(f"Generated test path escapes tests/generated/: {generated_path}")

@@ -25,6 +25,7 @@ class NodeState(BaseModel):
     node_id: NodeId
     status: NodeStatus = "queued"
     retries: int = 0
+    duration_ms: int | None = None
     started_at: str | None = None
     finished_at: str | None = None
     inputs: list[ArtifactRef] = Field(default_factory=list)
@@ -39,6 +40,7 @@ class BatchState(BaseModel):
     mode: Literal["auto", "manual"] = "auto"
     status: BatchStatus = "queued"
     current_node: NodeId | None = None
+    repair_attempts: int = 0
     nodes: dict[NodeId, NodeState]
 
     @classmethod

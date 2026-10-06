@@ -76,7 +76,7 @@ class BestOfSelector:
         return [self.score_design(bid) for bid in batch_ids]
 
     def pick_winner(self, scores: list[dict[str, Any]]) -> dict[str, Any] | None:
-        valid = [s for s in scores if s["score"] >= 0]
+        valid = [s for s in scores if s["score"] > 0 and s.get("reason") == "scored"]
         return max(valid, key=lambda s: s["score"]) if valid else None
 
     def create_seeded_batch(self, winner_batch_id: str) -> BatchState:

@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -26,23 +29,30 @@ class FileStore:
         return path.resolve().relative_to(self.root_dir).as_posix()
 
     def resolve(self, relative_path: str) -> Path:
+        if "\\" in relative_path or Path(relative_path).is_absolute():
+            raise ValueError("Artifact paths must be project-relative POSIX paths")
         target = (self.root_dir / relative_path).resolve()
         if self.root_dir not in target.parents and target != self.root_dir:
             raise ValueError("Path escapes project root")
         return target
 
     def batch_dir(self, batch_id: str) -> Path:
+        self.validate_batch_id(batch_id)
         path = self.generated_dir / batch_id
+        self.relpath(path)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     def output_batch_dir(self, batch_id: str) -> Path:
+        self.validate_batch_id(batch_id)
         path = self.output_dir / batch_id
+        self.relpath(path)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     def save_uploaded_spec(self, *, batch_id: str, filename: str, content: bytes) -> Path:
-        safe_name = Path(filename).name or "spec.md"
+        self.validate_batch_id(batch_id)
+        safe_name = Path(filename.replace("\\", "/")).name or "spec.md"
         if not safe_name.endswith(".md"):
             safe_name = f"{safe_name}.md"
         spec_path = self.pending_dir / f"{batch_id}_{safe_name}"
@@ -50,19 +60,30 @@ class FileStore:
         return spec_path
 
     def copy_spec(self, *, batch_id: str, source_path: Path) -> Path:
+        self.validate_batch_id(batch_id)
         target = self.pending_dir / f"{batch_id}_{source_path.name}"
         shutil.copy2(source_path, target)
         return target
 
     def write_text(self, path: Path, content: str) -> ArtifactRef:
+        self.relpath(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        fd, temporary = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         return self.artifact_for(path)
 
     def write_json(self, path: Path, data: Any) -> ArtifactRef:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        return self.artifact_for(path)
+        return self.write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def validate_batch_id(batch_id: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", batch_id):
+            raise ValueError("Invalid batch_id")
 
     def read_json(self, path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -103,7 +124,8 @@ class FileStore:
         self.write_json(self.status_path(state.batch_id), state.model_dump(mode="json"))
 
     def load_state(self, batch_id: str) -> BatchState:
-        return BatchState.model_validate(self.read_json(self.status_path(batch_id)))
+        self.validate_batch_id(batch_id)
+        return BatchState.model_validate(self.read_json(self.generated_dir / batch_id / "batch_status.json"))
 
     def init_logs(self, batch_id: str) -> None:
         path = self.log_path(batch_id)
@@ -117,7 +139,7 @@ class FileStore:
         if path.exists():
             logs = json.loads(path.read_text(encoding="utf-8") or "[]")
         logs.append(entry.model_dump(mode="json"))
-        path.write_text(json.dumps(logs, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.write_json(path, logs)
 
     def list_artifacts(self, batch_id: str) -> list[dict[str, str]]:
         base = self.batch_dir(batch_id)

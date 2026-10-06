@@ -6,6 +6,8 @@ from app.agents.base import BaseAgent
 
 
 class DesignManifest(BaseModel):
+    generation_profile: str = "llm"
+    requirements_summary: list[str] = Field(default_factory=list)
     system_name: str
     modules: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
