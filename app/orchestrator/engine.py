@@ -13,6 +13,7 @@ from app.agents.code_agent import CodeAgent
 from app.agents.design_agent import DesignAgent
 from app.agents.test_agent import TestAgent
 from app.config import get_settings
+from app.demo_fixtures import SAMPLE_FIXTURE_ID
 from app.orchestrator.logger import ExecutionLogger
 from app.orchestrator.state import ArtifactRef, BatchState, NodeId, now_iso
 from app.storage.file_store import FileStore
@@ -80,20 +81,25 @@ class Orchestrator:
         filename: str,
         content: bytes,
         mode: Literal["auto", "manual"] = "auto",
+        sample_fixture: str | None = None,
     ) -> BatchState:
+        if sample_fixture not in (None, SAMPLE_FIXTURE_ID):
+            raise ValueError(f"Unknown sample fixture: {sample_fixture}")
         batch_id = self._new_batch_id()
         spec_path = self.store.save_uploaded_spec(batch_id=batch_id, filename=filename, content=content)
-        state = BatchState.new(batch_id=batch_id, spec_path=self.store.relpath(spec_path), mode=mode)
+        state = BatchState.new(batch_id=batch_id, spec_path=self.store.relpath(spec_path), mode=mode, sample_fixture=sample_fixture)
         self.store.batch_dir(batch_id)
         self.store.save_state(state)
         self.store.init_logs(batch_id)
         self.logger.log(batch_id=batch_id, event="batch_created", message="Batch created", metadata={"mode": mode})
         return state
 
-    def create_batch_from_path(self, spec_path: Path, mode: Literal["auto", "manual"] = "auto") -> BatchState:
+    def create_batch_from_path(self, spec_path: Path, mode: Literal["auto", "manual"] = "auto", sample_fixture: str | None = None) -> BatchState:
+        if sample_fixture not in (None, SAMPLE_FIXTURE_ID):
+            raise ValueError(f"Unknown sample fixture: {sample_fixture}")
         batch_id = self._new_batch_id()
         copied = self.store.copy_spec(batch_id=batch_id, source_path=spec_path)
-        state = BatchState.new(batch_id=batch_id, spec_path=self.store.relpath(copied), mode=mode)
+        state = BatchState.new(batch_id=batch_id, spec_path=self.store.relpath(copied), mode=mode, sample_fixture=sample_fixture)
         self.store.batch_dir(batch_id)
         self.store.save_state(state)
         self.store.init_logs(batch_id)
@@ -231,7 +237,7 @@ class Orchestrator:
         started = time.perf_counter()
         try:
             node.inputs = self._inputs_for(state, node_id)
-            outputs = self._agent_for(node_id).run({"batch_id": state.batch_id, "spec_path": state.spec_path})
+            outputs = self._agent_for(node_id).run({"batch_id": state.batch_id, "spec_path": state.spec_path, "sample_fixture": state.sample_fixture or ""})
             node.outputs = [output for output in outputs if isinstance(output, ArtifactRef)]
             node.quality_check_result = self._validator_for(node_id).validate(state.batch_id)
             node.status = "succeeded"

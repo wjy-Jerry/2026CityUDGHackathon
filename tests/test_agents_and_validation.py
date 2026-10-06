@@ -21,7 +21,8 @@ def generate(engine, batch):
 def test_offline_agent_fallbacks_and_structured_contract(engine, official_batch):
     root = generate(engine, official_batch)
     manifest = engine.store.read_json(root / 'code_manifest.json')
-    assert manifest['strategy'] == 'template-fallback'
+    assert manifest['strategy'] == 'sample-fixture'
+    assert manifest['sample_fixture'] == 'vehicle_reservations'
     design = engine.store.read_json(engine.store.batch_dir(official_batch.batch_id) / '概要设计/design_manifest.json')
     assert manifest['system_name'] == design['system_name']
     assert official_batch.batch_id in (root / 'README.md').read_text()

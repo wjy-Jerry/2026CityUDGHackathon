@@ -31,7 +31,7 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/v1/batches")
-async def create_batch(file: UploadFile = File(...), mode: str = Form("auto")) -> dict[str, object]:
+async def create_batch(file: UploadFile = File(...), mode: str = Form("auto"), sample_fixture: str = Form("")) -> dict[str, object]:
     if not file.filename or not file.filename.endswith(".md"):
         raise HTTPException(status_code=400, detail={"message": "Please upload a Markdown .md file"})
     if mode not in {"auto", "manual"}:
@@ -43,7 +43,10 @@ async def create_batch(file: UploadFile = File(...), mode: str = Form("auto")) -
         content.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise HTTPException(400, detail={"message": "Specification must be UTF-8 encoded"}) from exc
-    state = orchestrator.create_batch_from_bytes(filename=file.filename, content=content, mode=mode)  # type: ignore[arg-type]
+    try:
+        state = orchestrator.create_batch_from_bytes(filename=file.filename, content=content, mode=mode, sample_fixture=sample_fixture or None)  # type: ignore[arg-type]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"message": str(exc)}) from exc
     return {"batch_id": state.batch_id, "state": state.model_dump(mode="json")}
 
 

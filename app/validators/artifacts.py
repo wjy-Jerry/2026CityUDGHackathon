@@ -79,19 +79,46 @@ class DesignArtifactValidator:
 
 
 SMOKE_SCRIPT = """
+import importlib
+import inspect
 import json
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from src.api import app
 assert isinstance(app, FastAPI), 'src.api.app must be FastAPI'
+manifest = json.loads(Path('code_manifest.json').read_text(encoding='utf-8'))
+assert 'src.api:app' in str(manifest.get('entrypoint', '')).split(), 'Manifest entrypoint must be src.api:app'
+contract = manifest.get('storage_contract')
+assert isinstance(contract, dict), 'Manifest storage_contract is required'
+module_name = contract.get('module')
+attribute = contract.get('service_attribute')
+factory_path = contract.get('factory')
+argument = contract.get('argument')
+assert all(isinstance(value, str) and value for value in (module_name, attribute, factory_path, argument)), 'Manifest storage_contract fields must be non-empty'
+module = importlib.import_module(module_name)
+assert hasattr(module, attribute), f'Manifest storage service missing: {module_name}.{attribute}'
+factory_module, separator, factory_name = factory_path.rpartition('.')
+assert separator, f'Manifest storage factory must be a module-qualified path: {factory_path}'
+factory = getattr(importlib.import_module(factory_module), factory_name)
+assert callable(factory), f'Manifest storage factory is not callable: {factory_path}'
+try:
+    inspect.signature(factory).bind(**{argument: Path('data')})
+except TypeError as exc:
+    raise AssertionError(f'Manifest storage factory cannot accept {argument}: {exc}') from exc
 with TestClient(app) as client:
     schema = client.get('/openapi.json')
     assert schema.status_code == 200, schema.text
     assert schema.json().get('paths'), 'No application routes'
+    actual = {(method.upper(), path) for path, methods in schema.json()['paths'].items() for method in methods if method.lower() in {'get', 'post', 'put', 'patch', 'delete', 'head', 'options'}}
+    routes = manifest.get('api_routes')
+    assert isinstance(routes, list) and routes, 'Manifest api_routes must be a non-empty list'
+    claimed = {(str(route['method']).upper(), route['path']) for route in routes}
+    assert actual == claimed, f'Manifest api_routes disagree with FastAPI OpenAPI: missing={sorted(claimed - actual)}, undocumented={sorted(actual - claimed)}'
     health = client.get('/health') if '/health' in schema.json()['paths'] else None
     if health is not None:
         assert health.status_code == 200, health.text
-print(json.dumps({'importable': True, 'startup_passed': True, 'routes': len(schema.json()['paths'])}))
+print(json.dumps({'importable': True, 'startup_passed': True, 'routes': len(schema.json()['paths']), 'manifest_consistent': True}))
 """
 
 
@@ -130,6 +157,7 @@ class CodeValidator:
                   "score": 100 if completed.returncode == 0 else 0,
                   "checks": {"python_syntax_valid": True, "fastapi_app_importable": completed.returncode == 0,
                              "application_smoke_passed": completed.returncode == 0,
+                             "manifest_consistent": completed.returncode == 0,
                              "frontend_required": frontend_required, "frontend_present": frontend.is_file()},
                   "files": [p.relative_to(root).as_posix() for p in files],
                   "smoke_output": output[-6000:], "summary": output[-6000:]}

@@ -4,6 +4,7 @@ import pytest
 from app.adapters.llm import MockLLMAdapter
 from app.orchestrator.engine import Orchestrator
 from app.storage.file_store import FileStore
+from app.demo_fixtures import SAMPLE_FIXTURE_ID
 
 ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL_SPEC = next((ROOT / 'problem').glob('试题成果验证*.md'))
@@ -19,4 +20,4 @@ def engine(store):
 
 @pytest.fixture
 def official_batch(engine):
-    return engine.create_batch_from_path(OFFICIAL_SPEC)
+    return engine.create_batch_from_path(OFFICIAL_SPEC, sample_fixture=SAMPLE_FIXTURE_ID)

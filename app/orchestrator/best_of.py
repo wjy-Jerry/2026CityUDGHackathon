@@ -95,6 +95,7 @@ class BestOfSelector:
             batch_id=new_batch_id,
             spec_path=self.store.relpath(new_spec),
             mode="auto",
+            sample_fixture=winner_state.sample_fixture,
         )
 
         # Copy design artifacts so CodeAgent can read them by batch_id directory convention

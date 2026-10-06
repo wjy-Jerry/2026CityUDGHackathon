@@ -34,8 +34,10 @@ st.session_state.setdefault('batch_id', '')
 
 with st.form('create'):
     uploaded = st.file_uploader('上传产品规格说明书 (.md)', type=['md'])
-    use_official = st.checkbox('使用官方员工临时车辆预约规格', value=True)
-    mode = st.selectbox('执行模式', ['auto', 'manual'], help='manual 在设计完成后暂停，逐步审批代码和测试节点。')
+    use_official = st.checkbox('使用官方车辆预约规格 + 确定性示例 fixture（非任意需求自动生成）', value=True)
+    mode = st.selectbox('执行模式', ['auto', 'manual'], help='manual 在设计完成后暂停，逐步审批代码和测试节点；测试失败时仍可能自动执行一次 CodeAgent 修复和复验。')
+    if mode == 'manual':
+        st.caption('手动模式下，测试失败后仍可能自动重跑 CodeAgent 一次并用原测试复验；每批最多一次。')
     submitted = st.form_submit_button('创建并启动流水线', type='primary')
     if submitted:
         if uploaded:
@@ -48,7 +50,8 @@ with st.form('create'):
         if not content:
             st.warning('请上传规格或选择官方示例。')
         else:
-            response = api('POST', '/api/v1/batches', files={'file':(name, content, 'text/markdown')}, data={'mode':mode})
+            fixture = 'vehicle_reservations' if use_official and not uploaded else ''
+            response = api('POST', '/api/v1/batches', files={'file':(name, content, 'text/markdown')}, data={'mode':mode, 'sample_fixture':fixture})
             if response is not None:
                 st.session_state.batch_id = response.json()['batch_id']
                 if api('POST', f"/api/v1/batches/{st.session_state.batch_id}/run") is not None:
@@ -71,6 +74,10 @@ def dashboard():
     status = state['status']
     st.subheader(f"{ICONS.get(status, '')} 流水线：{status}")
     st.caption(f"模式：{state['mode']} · 当前节点：{state.get('current_node') or '—'} · 修复次数：{state.get('repair_attempts', 0)}/1")
+    if state['mode'] == 'manual':
+        st.caption('测试失败后可自动重跑 CodeAgent 一次并复验，即使本批次处于手动模式。')
+    if state.get('sample_fixture'):
+        st.warning(f"确定性示例 fixture：{state['sample_fixture']}。此结果仅验证官方样例，不证明任意规格可自动实现。")
     columns = st.columns(4)
     for col, nid in zip(columns[:3], LABELS):
         node = state['nodes'][nid]
@@ -87,10 +94,16 @@ def dashboard():
         passed = status == 'succeeded' and quality.get('passed', False)
         st.metric('Validation', '✅ passed' if passed else '❌ failed' if status == 'failed' else '⏳ pending')
     code_quality = state['nodes']['code'].get('quality_check_result', {})
-    if 'fallback' in code_quality.get('generation_strategy', ''):
-        st.info('本批次使用确定性离线模板。领域需求的完整实现应使用真实 LLM 模式；离线模板限制见下方。')
+    if code_quality.get('generation_strategy') == 'generic-template-fallback':
+        st.info('本批次使用通用离线记录 CRUD 模板，验证编排流程；领域规则需要真实 LLM 生成。')
         for limitation in code_quality.get('limitations', []):
             st.caption(limitation)
+    elif code_quality.get('generation_strategy') == 'sample-fixture':
+        st.info('本批次使用明确选择的车辆预约确定性示例 fixture；不是任意规格的自动生成结果。')
+        for limitation in code_quality.get('limitations', []):
+            st.caption(limitation)
+    elif code_quality.get('generation_strategy') == 'llm-structured-generation':
+        st.info('本批次代码由真实 LLM 生成；请结合测试报告和需求逐项验收。')
     completed = sum(n['status'] == 'succeeded' for n in state['nodes'].values())
     st.progress(completed / 3, text=f'{completed}/3 Agent 节点完成')
     if quality:

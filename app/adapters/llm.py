@@ -33,7 +33,7 @@ class MockLLMAdapter:
     def generate_text(self, *, system: str, user: str, metadata: dict[str, str] | None = None) -> str:
         from app.agents.fallback import mock_overview
         spec = user.split("# 产品规格说明书\n")[-1].split("\n\n# 已生成")[0]
-        return mock_overview(spec)
+        return mock_overview(spec, (metadata or {}).get("sample_fixture") or None)
 
     def generate_json(
         self,
@@ -47,4 +47,4 @@ class MockLLMAdapter:
         if schema.__name__ != "DesignManifest":
             raise LLMError("Offline mode uses explicit code/test templates")
         spec = user.split("# 产品规格说明书\n")[-1].split("\n\n# 已生成")[0]
-        return schema.model_validate(mock_design(spec))
+        return schema.model_validate(mock_design(spec, (metadata or {}).get("sample_fixture") or None))

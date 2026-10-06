@@ -38,17 +38,19 @@ class BatchState(BaseModel):
     batch_id: str
     spec_path: str
     mode: Literal["auto", "manual"] = "auto"
+    sample_fixture: str | None = None
     status: BatchStatus = "queued"
     current_node: NodeId | None = None
     repair_attempts: int = 0
     nodes: dict[NodeId, NodeState]
 
     @classmethod
-    def new(cls, *, batch_id: str, spec_path: str, mode: Literal["auto", "manual"] = "auto") -> "BatchState":
+    def new(cls, *, batch_id: str, spec_path: str, mode: Literal["auto", "manual"] = "auto", sample_fixture: str | None = None) -> "BatchState":
         return cls(
             batch_id=batch_id,
             spec_path=spec_path,
             mode=mode,
+            sample_fixture=sample_fixture,
             nodes={
                 "design": NodeState(node_id="design"),
                 "code": NodeState(node_id="code"),

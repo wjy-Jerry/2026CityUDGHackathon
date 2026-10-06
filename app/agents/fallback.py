@@ -6,28 +6,20 @@ import re
 from html import escape
 
 
-def mock_design(spec: str) -> dict:
+def mock_design(spec: str, sample_fixture: str | None = None) -> dict:
     title = next((line.lstrip('# ').strip() for line in spec.splitlines() if line.startswith('#')), 'Generated Record Application')
-    vehicle = bool(re.search(r'车辆|vehicle', spec, re.I) and re.search(r'预约|reservation', spec, re.I))
+    from app.demo_fixtures import SAMPLE_FIXTURE_ID
+    if sample_fixture not in (None, SAMPLE_FIXTURE_ID):
+        raise ValueError(f"Unknown sample fixture: {sample_fixture}")
+    vehicle = sample_fixture == SAMPLE_FIXTURE_ID
     requirements = [line.strip('- *| ') for line in spec.splitlines() if line.strip()][:40]
-    common = {'system_name': title, 'generation_profile': 'vehicle' if vehicle else 'generic-records',
+    common = {'system_name': title, 'generation_profile': 'sample-fixture:vehicle_reservations' if vehicle else 'generic-records',
               'requirements_summary': requirements,
               'frontend_requirements': ['HTML form, records table, action buttons'] if re.search(r'web|前端|浏览器|B/S|BS架构|页面', spec, re.I) else [],
               'pages': ['Application'] if re.search(r'web|前端|浏览器|B/S|BS架构|页面', spec, re.I) else []}
     if vehicle:
-        common.update(modules=['campus configuration', 'reservation', 'cancellation', 'advance payment', 'CSV integration'],
-                      entities=['CampusConfig', 'Reservation', 'PaymentRecord', 'InternalVehicleArchive'],
-                      business_rules=['Reserve today through 7 days ahead', 'One plate per day across campuses',
-                                      'Reject disabled or full campus', 'Reject internally registered vehicles',
-                                      'Cancellation releases quota and updates archive', 'Payment is idempotent'],
-                      api_endpoints=['GET /health', 'GET /campuses', 'GET /availability', 'PUT /campuses/{campus}',
-                                     'GET /reservations', 'POST /reservations', 'POST /reservations/{reservation_id}/cancel',
-                                     'POST /reservations/{reservation_id}/pay'],
-                      csv_tables=['campus_configs.csv', 'reservations.csv', 'ketuo_reservation_archive.csv',
-                                  'payment_records.csv', 'internal_vehicle_archive.csv'],
-                      validation_rules=['date_window', 'daily_quota', 'plate_format', 'duplicate_plate', 'internal_vehicle'],
-                      acceptance_criteria=['Persist two reservations', 'Reject duplicate and internal vehicle',
-                                           'Cancellation releases quota', 'Persist campus in payment record'])
+        from app.demo_fixtures.vehicle_reservations import design_details
+        common.update(design_details())
     else:
         common.update(modules=['record management', 'CSV persistence'], entities=['Record'],
                       business_rules=['Record title must be non-empty', 'Unknown records return 404'],
@@ -37,15 +29,16 @@ def mock_design(spec: str) -> dict:
     return common
 
 
-def mock_overview(spec: str) -> str:
-    m = mock_design(spec)
+def mock_overview(spec: str, sample_fixture: str | None = None) -> str:
+    m = mock_design(spec, sample_fixture)
+    vehicle = sample_fixture is not None
     sections = [
         ('引言', f"系统：{m['system_name']}\n来源需求摘要：\n" + '\n'.join(m['requirements_summary'])),
-        ('总体设计', 'FastAPI + CSV + optional HTML. Offline template; requirement-specific functionality beyond this profile requires real LLM generation. Authentication is not implemented in offline templates.'),
+        ('总体设计', 'FastAPI + CSV + optional HTML. ' + ('Explicit deterministic vehicle reservation sample fixture.' if vehicle else 'Generic offline record CRUD pipeline; domain-specific rules require real LLM generation.') + ' Authentication is not implemented in offline templates.'),
         ('接口设计', '\n'.join(m['api_endpoints'])),
         ('数据结构设计', '\n'.join(m['entities'] + m['csv_tables'])),
         ('业务规则设计', '\n'.join(m['business_rules'])),
-        ('出错处理设计', 'Input validation: 422. Generic missing resource: 404. Vehicle business errors: success=false with a message. Storage exceptions surface as server errors.'),
+        ('出错处理设计', 'Input validation: 422. ' + ('Vehicle business errors: success=false with a message. ' if vehicle else 'Unknown records: 404. ') + 'Storage exceptions surface as server errors.'),
         ('集成模拟设计', 'Local CSV only. No hardware, payment gateway or external services.'),
         ('验收标准', '\n'.join(m['acceptance_criteria'])),
     ]
