@@ -6,6 +6,8 @@ from app.agents.base import BaseAgent
 
 
 class DesignManifest(BaseModel):
+    generation_profile: str = "llm"
+    requirements_summary: list[str] = Field(default_factory=list)
     system_name: str
     modules: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
@@ -27,7 +29,13 @@ class DesignAgent(BaseAgent):
         spec_path = input_context["spec_path"]
         spec_text = self.read_text(spec_path)
         prompt = self.load_prompt()
-        metadata = {"batch_id": batch_id, "node_id": "design"}
+        selected_fixture = input_context.get("sample_fixture") or self.store.load_state(batch_id).sample_fixture or ""
+        metadata = {"batch_id": batch_id, "node_id": "design", "sample_fixture": selected_fixture}
+        if metadata["sample_fixture"]:
+            from app.adapters.llm import MockLLMAdapter
+            adapter = MockLLMAdapter()
+        else:
+            adapter = self.llm
 
         overview_user = (
             "以下是产品规格说明书，请生成完整的概要设计文档（overview_design.md）。\n"
@@ -36,7 +44,7 @@ class DesignAgent(BaseAgent):
             "不得遗漏规格书中的任何功能需求，包括前端 UI、管理后台、外部系统集成。\n\n"
             f"# 产品规格说明书\n{spec_text}"
         )
-        overview = self.llm.generate_text(system=prompt, user=overview_user, metadata=metadata)
+        overview = adapter.generate_text(system=prompt, user=overview_user, metadata=metadata)
 
         manifest_user = (
             "根据下方的产品规格说明书和已生成的概要设计文档，输出 design_manifest.json。\n"
@@ -46,7 +54,7 @@ class DesignAgent(BaseAgent):
             f"# 产品规格说明书\n{spec_text}\n\n"
             f"# 已生成的概要设计文档\n{overview}"
         )
-        manifest = self.llm.generate_json(system=prompt, user=manifest_user, schema=DesignManifest, metadata=metadata)
+        manifest = adapter.generate_json(system=prompt, user=manifest_user, schema=DesignManifest, metadata=metadata)
 
         output_dir = self.batch_artifact_dir(batch_id, "概要设计")
         overview_ref = self.store.write_text(output_dir / "overview_design.md", overview)

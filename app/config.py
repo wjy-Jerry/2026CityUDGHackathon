@@ -59,6 +59,6 @@ def get_settings() -> Settings:
         code_model=_env_value("CODE_MODEL"),
         test_model=_env_value("TEST_MODEL"),
         app_env=os.getenv("APP_ENV", "dev"),
-        max_retries=max_retries,
+        max_retries=max(0, max_retries),
         llm_strict=llm_strict,
     )

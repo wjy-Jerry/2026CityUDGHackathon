@@ -76,7 +76,7 @@ class BestOfSelector:
         return [self.score_design(bid) for bid in batch_ids]
 
     def pick_winner(self, scores: list[dict[str, Any]]) -> dict[str, Any] | None:
-        valid = [s for s in scores if s["score"] >= 0]
+        valid = [s for s in scores if s["score"] > 0 and s.get("reason") == "scored"]
         return max(valid, key=lambda s: s["score"]) if valid else None
 
     def create_seeded_batch(self, winner_batch_id: str) -> BatchState:
@@ -95,6 +95,7 @@ class BestOfSelector:
             batch_id=new_batch_id,
             spec_path=self.store.relpath(new_spec),
             mode="auto",
+            sample_fixture=winner_state.sample_fixture,
         )
 
         # Copy design artifacts so CodeAgent can read them by batch_id directory convention
