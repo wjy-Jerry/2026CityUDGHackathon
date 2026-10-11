@@ -20,6 +20,7 @@ class Settings(BaseModel):
     design_model: str | None = None
     code_model: str | None = None
     test_model: str | None = None
+    code_max_output_tokens: int | None = None
     app_env: str = "dev"
     max_retries: int = 2
     llm_strict: bool = False
@@ -52,13 +53,21 @@ def get_settings() -> Settings:
         max_retries = 2
     openai_api_key = _env_value("OPENAI_API_KEY")
     llm_strict = _env_bool("LLM_STRICT", default=bool(openai_api_key))
+    code_max_output_tokens_raw = _env_value("CODE_MAX_OUTPUT_TOKENS")
+    try:
+        code_max_output_tokens = int(code_max_output_tokens_raw) if code_max_output_tokens_raw else None
+        if code_max_output_tokens is not None and code_max_output_tokens <= 0:
+            code_max_output_tokens = None
+    except ValueError:
+        code_max_output_tokens = None
     return Settings(
         openai_api_key=openai_api_key,
         openai_base_url=_env_value("OPENAI_BASE_URL"),
         design_model=_env_value("DESIGN_MODEL"),
         code_model=_env_value("CODE_MODEL"),
         test_model=_env_value("TEST_MODEL"),
+        code_max_output_tokens=code_max_output_tokens,
         app_env=os.getenv("APP_ENV", "dev"),
-        max_retries=max_retries,
+        max_retries=max(0, max_retries),
         llm_strict=llm_strict,
     )

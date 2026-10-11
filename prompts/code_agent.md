@@ -78,6 +78,7 @@ frontend_pages    — 每个前端页面的元数据：
   name              页面名称
   purpose           支持的用户工作流描述
   controls          页面上的控件列表（表单字段、按钮、表格等）
+storage_contract  — {module: "src.api", service_attribute: 实际服务变量名, factory: 完整模块路径与工厂名, argument: "data_dir"}；工厂必须接受独立的数据目录，测试能通过此契约隔离存储
 run_instructions  — 本地运行所需的完整命令和 URL 列表
 ```
 
@@ -87,3 +88,5 @@ run_instructions  — 本地运行所需的完整命令和 URL 列表
 
 - 实现设计文档中的**每一条**验收标准。若某需求在本地无法完全实现（如硬件接口），用同等数据契约的本地模拟代替，但接口形式必须完整。
 - 生成的产品须能以 `uvicorn src.api:app --reload` 启动后端；若有前端，须能在浏览器中直接打开 `frontend/index.html` 使用。
+
+前端建议与后端同源提供，通过相对 URL 调用 API，以支持不同端口运行。

@@ -1,668 +1,21 @@
 from __future__ import annotations
 
 import shutil
+import json
 from pathlib import Path
-from textwrap import dedent
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.agents.base import BaseAgent
 
 
-BUSINESS_FILES: dict[str, str] = {
-    "__init__.py": '"""Generated employee vehicle reservation business system."""\n',
-    "models.py": r'''
-from __future__ import annotations
 
-from datetime import date
-from pydantic import BaseModel, Field
-
-
-class ReservationCreate(BaseModel):
-    name: str = Field(min_length=1)
-    employee_id: str = Field(min_length=1)
-    mobile: str = Field(min_length=5)
-    campus: str
-    reservation_date: date
-    plate_no: str
-
-
-class ReservationCancel(BaseModel):
-    reservation_id: str
-
-
-class ReservationResponse(BaseModel):
-    success: bool
-    message: str
-    reservation_id: str | None = None
-''',
-    "csv_repository.py": r'''
-from __future__ import annotations
-
-import csv
-import os
-from pathlib import Path
-from typing import Callable
-
-
-DEFAULT_SCHEMAS: dict[str, list[str]] = {
-    "campus_configs.csv": ["campus", "weekday_quota", "rest_day_quota", "enabled", "instruction"],
-    "reservations.csv": [
-        "reservation_id", "name", "employee_id", "mobile", "campus", "reservation_date", "plate_no", "status"
-    ],
-    "ketuo_reservation_archive.csv": ["reservation_id", "plate_no", "campus", "reserve_date", "status", "remark"],
-    "payment_records.csv": ["payment_id", "reservation_id", "plate_no", "amount", "status", "created_at"],
-    "internal_vehicle_archive.csv": ["plate_no", "owner", "remark"],
-}
-
-
-class CSVRepository:
-    def __init__(self, base_dir: Path | str = "data", schemas: dict[str, list[str]] | None = None) -> None:
-        self.base_dir = Path(base_dir)
-        self.schemas = schemas or DEFAULT_SCHEMAS
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-
-    def initialize(self) -> None:
-        for table, headers in self.schemas.items():
-            path = self.path_for(table)
-            if not path.exists():
-                self._atomic_write(path, [], headers)
-
-    def path_for(self, table: str) -> Path:
-        if table not in self.schemas:
-            raise ValueError(f"Unknown CSV table: {table}")
-        return self.base_dir / table
-
-    def read_all(self, table: str) -> list[dict[str, str]]:
-        path = self.path_for(table)
-        if not path.exists():
-            self._atomic_write(path, [], self.schemas[table])
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            return list(csv.DictReader(handle))
-
-    def query(self, table: str, predicate: Callable[[dict[str, str]], bool]) -> list[dict[str, str]]:
-        return [row for row in self.read_all(table) if predicate(row)]
-
-    def append(self, table: str, row: dict[str, object]) -> dict[str, str]:
-        rows = self.read_all(table)
-        normalized = self._normalize(table, row)
-        rows.append(normalized)
-        self._atomic_write(self.path_for(table), rows, self.schemas[table])
-        return normalized
-
-    def update(
-        self,
-        table: str,
-        predicate: Callable[[dict[str, str]], bool],
-        changes: dict[str, object],
-    ) -> int:
-        rows = self.read_all(table)
-        count = 0
-        for row in rows:
-            if predicate(row):
-                for key, value in changes.items():
-                    if key not in self.schemas[table]:
-                        raise ValueError(f"Unknown field {key} for table {table}")
-                    row[key] = str(value)
-                count += 1
-        if count:
-            self._atomic_write(self.path_for(table), rows, self.schemas[table])
-        return count
-
-    def _normalize(self, table: str, row: dict[str, object]) -> dict[str, str]:
-        headers = self.schemas[table]
-        return {header: str(row.get(header, "")) for header in headers}
-
-    def _atomic_write(self, path: Path, rows: list[dict[str, str]], headers: list[str]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + ".tmp")
-        with temp_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=headers)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({header: row.get(header, "") for header in headers})
-        os.replace(temp_path, path)
-''',
-    "services.py": r'''
-from __future__ import annotations
-
-import re
-import uuid
-from datetime import date, datetime, timedelta
-from pathlib import Path
-
-from src.csv_repository import CSVRepository
-from src.models import ReservationCreate
-
-
-CAMPUSES = ["Weifang", "Qingdao", "Rongcheng", "Dongguan"]
-DISABLED_MESSAGE = "当前园区暂不开放预约"
-PAYMENT_SUCCESS_MESSAGE = "缴费成功，离厂时无需支付"
-
-
-class ReservationService:
-    def __init__(self, data_dir: Path | str = "data") -> None:
-        self.repository = CSVRepository(data_dir)
-        self.repository.initialize()
-        self.ensure_default_campus_configs()
-
-    def ensure_default_campus_configs(self) -> None:
-        if self.repository.read_all("campus_configs.csv"):
-            return
-        for campus in CAMPUSES:
-            self.repository.append(
-                "campus_configs.csv",
-                {
-                    "campus": campus,
-                    "weekday_quota": 2,
-                    "rest_day_quota": 1,
-                    "enabled": "true",
-                    "instruction": f"{campus} campus temporary reservation",
-                },
-            )
-
-    def list_campuses(self) -> list[dict[str, str]]:
-        return self.repository.read_all("campus_configs.csv")
-
-    def list_reservations(self) -> list[dict[str, str]]:
-        return self.repository.read_all("reservations.csv")
-
-    def create_reservation(self, request: ReservationCreate) -> dict[str, object]:
-        config = self._campus_config(request.campus)
-        if not config or config.get("enabled", "").lower() != "true":
-            return {"success": False, "message": DISABLED_MESSAGE, "reservation_id": None}
-        if not self._valid_plate(request.plate_no):
-            return {"success": False, "message": "车牌号格式不正确", "reservation_id": None}
-        if not self._within_next_seven_days(request.reservation_date):
-            return {"success": False, "message": "预约日期必须在未来7天内", "reservation_id": None}
-        if self._duplicate_plate(request.plate_no, request.reservation_date):
-            return {"success": False, "message": "同一车牌同一天只能预约一个园区", "reservation_id": None}
-        if self._active_count(request.campus, request.reservation_date) >= self._quota(config, request.reservation_date):
-            return {"success": False, "message": "当日预约名额已满", "reservation_id": None}
-
-        reservation_id = uuid.uuid4().hex[:12]
-        row = {
-            "reservation_id": reservation_id,
-            "name": request.name,
-            "employee_id": request.employee_id,
-            "mobile": request.mobile,
-            "campus": request.campus,
-            "reservation_date": request.reservation_date.isoformat(),
-            "plate_no": request.plate_no.upper(),
-            "status": "success",
-        }
-        self.repository.append("reservations.csv", row)
-        self.repository.append(
-            "ketuo_reservation_archive.csv",
-            {
-                "reservation_id": reservation_id,
-                "plate_no": request.plate_no.upper(),
-                "campus": request.campus,
-                "reserve_date": request.reservation_date.isoformat(),
-                "status": "success",
-                "remark": f"{request.name}/{request.employee_id}/{request.mobile}",
-            },
-        )
-        return {"success": True, "message": "预约成功", "reservation_id": reservation_id}
-
-    def cancel_reservation(self, reservation_id: str) -> dict[str, object]:
-        matches = self.repository.query(
-            "reservations.csv",
-            lambda row: row["reservation_id"] == reservation_id and row["status"] == "success",
-        )
-        if not matches:
-            return {"success": False, "message": "未找到可取消的预约", "reservation_id": reservation_id}
-        self.repository.update(
-            "reservations.csv",
-            lambda row: row["reservation_id"] == reservation_id,
-            {"status": "cancelled"},
-        )
-        self.repository.update(
-            "ketuo_reservation_archive.csv",
-            lambda row: row["reservation_id"] == reservation_id,
-            {"status": "cancelled"},
-        )
-        return {"success": True, "message": "取消成功", "reservation_id": reservation_id}
-
-    def advance_payment(self, reservation_id: str) -> dict[str, object]:
-        matches = self.repository.query(
-            "reservations.csv",
-            lambda row: row["reservation_id"] == reservation_id and row["status"] == "success",
-        )
-        if not matches:
-            return {"success": False, "message": "未找到可缴费的预约", "reservation_id": reservation_id}
-        reservation = matches[0]
-        payment_id = uuid.uuid4().hex[:12]
-        self.repository.append(
-            "payment_records.csv",
-            {
-                "payment_id": payment_id,
-                "reservation_id": reservation_id,
-                "plate_no": reservation["plate_no"],
-                "amount": "20.00",
-                "status": "success",
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            },
-        )
-        return {
-            "success": True,
-            "message": PAYMENT_SUCCESS_MESSAGE,
-            "reservation_id": reservation_id,
-            "payment_id": payment_id,
-        }
-
-    def set_campus_enabled(self, campus: str, enabled: bool) -> None:
-        self.repository.update("campus_configs.csv", lambda row: row["campus"] == campus, {"enabled": str(enabled).lower()})
-
-    def _campus_config(self, campus: str) -> dict[str, str] | None:
-        matches = self.repository.query("campus_configs.csv", lambda row: row["campus"] == campus)
-        return matches[0] if matches else None
-
-    def _quota(self, config: dict[str, str], reservation_date: date) -> int:
-        key = "weekday_quota" if reservation_date.weekday() < 5 else "rest_day_quota"
-        return int(config[key])
-
-    def _active_count(self, campus: str, reservation_date: date) -> int:
-        day = reservation_date.isoformat()
-        return len(
-            self.repository.query(
-                "reservations.csv",
-                lambda row: row["campus"] == campus and row["reservation_date"] == day and row["status"] == "success",
-            )
-        )
-
-    def _duplicate_plate(self, plate_no: str, reservation_date: date) -> bool:
-        day = reservation_date.isoformat()
-        plate = plate_no.upper()
-        return bool(
-            self.repository.query(
-                "reservations.csv",
-                lambda row: row["plate_no"].upper() == plate and row["reservation_date"] == day and row["status"] == "success",
-            )
-        )
-
-    def _within_next_seven_days(self, reservation_date: date) -> bool:
-        today = date.today()
-        return today <= reservation_date <= today + timedelta(days=7)
-
-    def _valid_plate(self, plate_no: str) -> bool:
-        value = plate_no.strip().upper()
-        if len(value) not in {7, 8}:
-            return False
-        return bool(re.match(r"^[\u4e00-\u9fa5][A-Z][A-Z0-9]{5,6}$", value))
-''',
-    "api.py": r'''
-from __future__ import annotations
-
-from pathlib import Path
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-from src.models import ReservationCreate
-from src.services import ReservationService
-
-
-app = FastAPI(title="Employee Temporary Vehicle Reservation System")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-service = ReservationService(Path("data"))
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "employee-vehicle-reservation"}
-
-
-@app.get("/campuses")
-def campuses() -> list[dict[str, str]]:
-    return service.list_campuses()
-
-
-@app.get("/reservations")
-def reservations() -> list[dict[str, str]]:
-    return service.list_reservations()
-
-
-@app.post("/reservations")
-def create_reservation(request: ReservationCreate) -> dict[str, object]:
-    return service.create_reservation(request)
-
-
-@app.post("/reservations/{reservation_id}/cancel")
-def cancel_reservation(reservation_id: str) -> dict[str, object]:
-    return service.cancel_reservation(reservation_id)
-
-
-@app.post("/reservations/{reservation_id}/pay")
-def advance_payment(reservation_id: str) -> dict[str, object]:
-    return service.advance_payment(reservation_id)
-''',
-}
-
-
-FRONTEND_FILES: dict[str, str] = {
-    "index.html": r'''
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>员工临时车辆预约管理系统</title>
-  <link rel="stylesheet" href="./styles.css">
-</head>
-<body>
-  <header class="topbar">
-    <div>
-      <h1>员工临时车辆预约管理系统</h1>
-      <p>员工预约、取消、提前缴费与管理员园区配额管理</p>
-    </div>
-    <span id="healthStatus" class="status">待连接</span>
-  </header>
-
-  <main class="layout">
-    <section class="panel">
-      <h2>员工预约</h2>
-      <form id="reservationForm" class="grid-form">
-        <label>姓名<input name="name" required value="Alice"></label>
-        <label>工号<input name="employee_id" required value="E001"></label>
-        <label>手机号<input name="mobile" required value="13800000000"></label>
-        <label>园区<select name="campus" id="campusSelect" required></select></label>
-        <label>预约日期<input name="reservation_date" id="reservationDate" type="date" required></label>
-        <label>车牌号<input name="plate_no" required placeholder="鲁G12345 / 鲁G12345E"></label>
-        <button type="submit">提交预约</button>
-      </form>
-      <p id="reservationMessage" class="message"></p>
-      <div class="hint" id="campusInstruction">请选择园区查看临时车预约说明。</div>
-    </section>
-
-    <section class="panel">
-      <div class="section-heading">
-        <h2>我的预约</h2>
-        <button id="refreshReservations" type="button">刷新</button>
-      </div>
-      <table>
-        <thead>
-          <tr><th>预约号</th><th>园区</th><th>日期</th><th>车牌</th><th>状态</th><th>操作</th></tr>
-        </thead>
-        <tbody id="reservationRows"></tbody>
-      </table>
-    </section>
-
-    <section class="panel">
-      <h2>管理员后台</h2>
-      <p class="hint">查看园区开关、工作日/休息日配额与说明文字。</p>
-      <table>
-        <thead>
-          <tr><th>园区</th><th>工作日配额</th><th>休息日配额</th><th>预约开关</th><th>说明</th></tr>
-        </thead>
-        <tbody id="campusRows"></tbody>
-      </table>
-    </section>
-  </main>
-
-  <script src="./app.js"></script>
-</body>
-</html>
-''',
-    "styles.css": r'''
-* {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  background: #f7f8fa;
-  color: #1f2937;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
-
-.topbar {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  align-items: center;
-  padding: 24px 32px;
-  background: #ffffff;
-  border-bottom: 1px solid #d7dde5;
-}
-
-h1, h2, p {
-  margin: 0;
-}
-
-h1 {
-  font-size: 24px;
-}
-
-h2 {
-  font-size: 18px;
-  margin-bottom: 16px;
-}
-
-.status, .message, .hint {
-  font-size: 14px;
-}
-
-.status {
-  padding: 6px 10px;
-  border: 1px solid #b7c4d4;
-  background: #eef3f8;
-  border-radius: 6px;
-  white-space: nowrap;
-}
-
-.layout {
-  display: grid;
-  gap: 20px;
-  padding: 24px 32px;
-}
-
-.panel {
-  background: #ffffff;
-  border: 1px solid #d7dde5;
-  border-radius: 8px;
-  padding: 20px;
-}
-
-.grid-form {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(160px, 1fr));
-  gap: 14px;
-  align-items: end;
-}
-
-label {
-  display: grid;
-  gap: 6px;
-  font-size: 14px;
-}
-
-input, select, button {
-  min-height: 38px;
-  border: 1px solid #b7c4d4;
-  border-radius: 6px;
-  padding: 8px 10px;
-  font: inherit;
-}
-
-button {
-  background: #14532d;
-  color: #ffffff;
-  border-color: #14532d;
-  cursor: pointer;
-}
-
-.section-heading {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-}
-
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 14px;
-}
-
-th, td {
-  padding: 10px;
-  border-bottom: 1px solid #e1e6ed;
-  text-align: left;
-}
-
-.message {
-  min-height: 22px;
-  margin-top: 12px;
-  font-weight: 600;
-}
-
-.hint {
-  margin-top: 10px;
-  color: #526172;
-}
-
-@media (max-width: 820px) {
-  .topbar {
-    align-items: flex-start;
-    flex-direction: column;
-    padding: 20px;
-  }
-
-  .layout {
-    padding: 16px;
-  }
-
-  .grid-form {
-    grid-template-columns: 1fr;
-  }
-}
-''',
-    "app.js": r'''
-const apiBase = "http://127.0.0.1:8000";
-
-const healthStatus = document.querySelector("#healthStatus");
-const campusSelect = document.querySelector("#campusSelect");
-const campusRows = document.querySelector("#campusRows");
-const reservationRows = document.querySelector("#reservationRows");
-const reservationForm = document.querySelector("#reservationForm");
-const reservationMessage = document.querySelector("#reservationMessage");
-const campusInstruction = document.querySelector("#campusInstruction");
-const reservationDate = document.querySelector("#reservationDate");
-
-function setMessage(text, ok = true) {
-  reservationMessage.textContent = text;
-  reservationMessage.style.color = ok ? "#14532d" : "#b42318";
-}
-
-async function request(path, options = {}) {
-  const response = await fetch(`${apiBase}${path}`, {
-    headers: {"Content-Type": "application/json"},
-    ...options,
-  });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-  return response.json();
-}
-
-function setDefaultDate() {
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  reservationDate.value = tomorrow.toISOString().slice(0, 10);
-}
-
-async function loadHealth() {
-  try {
-    const data = await request("/health");
-    healthStatus.textContent = data.status === "ok" ? "后端已连接" : "连接异常";
-  } catch {
-    healthStatus.textContent = "后端未连接";
-  }
-}
-
-async function loadCampuses() {
-  const campuses = await request("/campuses");
-  campusSelect.innerHTML = "";
-  campusRows.innerHTML = "";
-  for (const campus of campuses) {
-    const option = document.createElement("option");
-    option.value = campus.campus;
-    option.textContent = campus.campus;
-    option.dataset.instruction = campus.instruction || "";
-    campusSelect.appendChild(option);
-
-    const row = document.createElement("tr");
-    row.innerHTML = `<td>${campus.campus}</td><td>${campus.weekday_quota}</td><td>${campus.rest_day_quota}</td><td>${campus.enabled}</td><td>${campus.instruction}</td>`;
-    campusRows.appendChild(row);
-  }
-  updateInstruction();
-}
-
-function updateInstruction() {
-  const selected = campusSelect.selectedOptions[0];
-  campusInstruction.textContent = selected?.dataset.instruction || "请选择园区查看临时车预约说明。";
-}
-
-async function loadReservations() {
-  const reservations = await request("/reservations");
-  reservationRows.innerHTML = "";
-  for (const item of reservations) {
-    const row = document.createElement("tr");
-    row.innerHTML = `
-      <td>${item.reservation_id}</td>
-      <td>${item.campus}</td>
-      <td>${item.reservation_date}</td>
-      <td>${item.plate_no}</td>
-      <td>${item.status}</td>
-      <td>
-        <button data-action="pay" data-id="${item.reservation_id}" type="button">提前缴费</button>
-        <button data-action="cancel" data-id="${item.reservation_id}" type="button">取消</button>
-      </td>`;
-    reservationRows.appendChild(row);
-  }
-}
-
-reservationForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const payload = Object.fromEntries(new FormData(reservationForm).entries());
-  try {
-    const result = await request("/reservations", {method: "POST", body: JSON.stringify(payload)});
-    setMessage(result.message, result.success);
-    await loadReservations();
-  } catch (error) {
-    setMessage(`提交失败：${error.message}`, false);
-  }
-});
-
-campusSelect.addEventListener("change", updateInstruction);
-
-document.querySelector("#refreshReservations").addEventListener("click", loadReservations);
-
-reservationRows.addEventListener("click", async (event) => {
-  const button = event.target.closest("button");
-  if (!button) return;
-  const id = button.dataset.id;
-  const action = button.dataset.action;
-  const path = action === "pay" ? `/reservations/${id}/pay` : `/reservations/${id}/cancel`;
-  const result = await request(path, {method: "POST"});
-  setMessage(result.message, result.success);
-  await loadReservations();
-});
-
-setDefaultDate();
-loadHealth();
-loadCampuses().then(loadReservations).catch((error) => setMessage(`加载失败：${error.message}`, false));
-''',
-}
 
 
 class GeneratedCodeFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str = Field(
         pattern=r"^(src/.+\.py|frontend/.+\.(html|css|js))$",
         description="Project-relative backend Python path under src/ or static frontend path under frontend/",
@@ -670,19 +23,124 @@ class GeneratedCodeFile(BaseModel):
     content: str = Field(min_length=1, description="Complete file contents")
 
 
+class CodeManifestField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    type: str = Field(min_length=1)
+    description: str = ""
+
+
+class CodeManifestRoute(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, pattern=r"^/")
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+    summary: str = ""
+    request_fields: list[CodeManifestField] = Field(default_factory=list)
+    response_fields: list[CodeManifestField] = Field(default_factory=list)
+    error_cases: list[str] = Field(default_factory=list)
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def normalize_method(cls, value: object) -> object:
+        return value.upper() if isinstance(value, str) else value
+
+
+class CodeManifestDataModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    fields: list[CodeManifestField] = Field(default_factory=list)
+
+
+class CodeManifestFrontendPage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    purpose: str = Field(min_length=1)
+    controls: list[str] = Field(default_factory=list)
+
+
+class CodeManifestStorageContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    module: str = Field(min_length=1, pattern=r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
+    service_attribute: str = Field(min_length=1, pattern=r"^[A-Za-z_]\w*$")
+    factory: str = Field(min_length=3, pattern=r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$")
+    argument: str = Field(min_length=1, pattern=r"^[A-Za-z_]\w*$")
+
+
+class CodeManifest(BaseModel):
+    """Validated contract persisted for application verification and TestAgent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    system_name: str = Field(min_length=1)
+    entrypoint: str = Field(min_length=1)
+    api_routes: list[CodeManifestRoute] = Field(min_length=1)
+    data_models: list[CodeManifestDataModel] = Field(default_factory=list)
+    business_rules: list[str] = Field(default_factory=list)
+    business_functions: list[str] = Field(default_factory=list)
+    csv_tables: list[str] = Field(default_factory=list)
+    frontend_pages: list[CodeManifestFrontendPage] = Field(default_factory=list)
+    storage_contract: CodeManifestStorageContract
+    run_instructions: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    strategy: str | None = None
+    sample_fixture: str | None = None
+    source_root: Literal["src"] = "src"
+    modules: list[str] = Field(default_factory=list)
+    frontend_root: str | None = None
+    frontend_files: list[str] = Field(default_factory=list)
+
+    @field_validator("entrypoint")
+    @classmethod
+    def require_fastapi_entrypoint(cls, value: str) -> str:
+        if "src.api:app" not in value.split():
+            raise ValueError("Manifest entrypoint must reference src.api:app")
+        return value
+
+    @model_validator(mode="after")
+    def require_unique_routes(self) -> "CodeManifest":
+        routes = [(route.method, route.path) for route in self.api_routes]
+        if len(routes) != len(set(routes)):
+            raise ValueError("Manifest api_routes must not contain duplicate method/path pairs")
+        return self
+
+
 class CodeGenerationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     files: list[GeneratedCodeFile] = Field(min_length=1)
-    manifest: dict[str, object] = Field(default_factory=dict)
+    manifest: CodeManifest
+
+    @model_validator(mode="after")
+    def validate_file_set(self) -> "CodeGenerationResult":
+        paths = [file.path for file in self.files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("Generated files must not contain duplicate paths")
+        missing = {"src/__init__.py", "src/api.py"} - set(paths)
+        if missing:
+            raise ValueError(f"Generated code is missing required files: {sorted(missing)}")
+        if self.manifest.frontend_pages and "frontend/index.html" not in paths:
+            raise ValueError("Manifest frontend_pages requires frontend/index.html")
+        return self
 
 
 class CodeAgent(BaseAgent):
     agent_name = "CodeAgent"
     prompt_file = "code_agent.md"
 
-    def run(self, input_context: dict[str, str]) -> list[object]:
+    def run(self, input_context: dict[str, Any]) -> list[object]:
         batch_id = input_context["batch_id"]
         spec_path = input_context["spec_path"]
-        result = self._generate_code(batch_id=batch_id, spec_path=spec_path)
+        result = self._generate_code(
+            batch_id=batch_id,
+            spec_path=spec_path,
+            retry_feedback=input_context.get("retry_feedback"),
+        )
 
         out_root = self.store.output_batch_dir(batch_id)
         src_dir = out_root / "src"
@@ -721,18 +179,34 @@ class CodeAgent(BaseAgent):
                 for path in sorted(frontend_snapshot_dir.rglob("*"))
                 if path.is_file()
             ]
+        self.store.write_text(out_root / "pytest.ini", "[pytest]\npythonpath = .\ntestpaths = tests/generated\n")
+        self.store.write_text(out_root / "requirements.txt", "fastapi>=0.111.0\nuvicorn>=0.30.0\npydantic>=2.7.0\nhttpx>=0.27.0\npytest>=8.2.0\npytest-cov>=5.0.0\n")
+        self.store.write_json(out_root / "code_manifest.json", code_manifest)
         (out_root / "README.md").write_text(self._readme(batch_id, code_manifest), encoding="utf-8")
 
         return [manifest_ref, *written_refs, *snapshot_refs, *frontend_snapshot_refs]
 
-    def _generate_code(self, *, batch_id: str, spec_path: str) -> CodeGenerationResult:
+    def _generate_code(
+        self,
+        *,
+        batch_id: str,
+        spec_path: str,
+        retry_feedback: dict[str, Any] | None = None,
+    ) -> CodeGenerationResult:
+        from app.demo_fixtures import SAMPLE_FIXTURE_ID
+        if self.store.load_state(batch_id).sample_fixture == SAMPLE_FIXTURE_ID:
+            from app.demo_fixtures.vehicle_reservations import code_result
+            design = json.loads(self._optional_batch_text(batch_id, "概要设计", "design_manifest.json"))
+            if design.get("generation_profile") != f"sample-fixture:{SAMPLE_FIXTURE_ID}":
+                raise ValueError("Design manifest does not match selected sample fixture")
+            return code_result(design["system_name"])
         prompt = self.load_prompt()
         spec_text = self.read_text(spec_path)
         overview = self._optional_batch_text(batch_id, "概要设计", "overview_design.md")
         manifest = self._optional_batch_text(batch_id, "概要设计", "design_manifest.json")
-        frontend_required = bool(manifest) and any(
+        frontend_required = bool(json.loads(manifest).get("frontend_requirements") or json.loads(manifest).get("pages")) or any(
             kw in (overview + manifest)
-            for kw in ("frontend_requirements", "pages", "Web", "B/S", "浏览器", "前端", "页面", "表单", "按钮", "后台")
+            for kw in ("Web", "B/S", "浏览器", "前端", "页面", "表单", "按钮", "后台")
         )
         frontend_instruction = (
             "IMPORTANT: The design mandates a frontend. You MUST generate frontend/index.html "
@@ -760,18 +234,37 @@ class CodeAgent(BaseAgent):
             "  business_rules: 完整的业务规则描述列表（每条为完整中文句子）\n"
             "  csv_tables: 所有 CSV 存储文件名列表\n"
             "  frontend_pages: [{path, name, purpose, controls:[str]}]，每个页面一条\n"
+            "  storage_contract: {module, service_attribute, factory, argument}; factory accepts data_dir for isolated tests\n"
+            "  entrypoint: complete command containing the exact target src.api:app\n"
             "  run_instructions: 本地启动所需的完整命令和 URL 列表\n\n"
             f"# 产品规格说明书（背景参考）\n{spec_text}\n\n"
             f"# 概要设计文档（主要权威输入）\n{overview}\n\n"
             f"# 设计清单 design_manifest.json\n{manifest}\n"
         )
+        repair = self.store.batch_dir(batch_id) / "repair_report.json"
+        if repair.is_file():
+            user += "\n# Structured repair feedback\n" + repair.read_text(encoding="utf-8")
+        if retry_feedback:
+            user += (
+                "\nThe previous attempt failed validation. Correct the issues in this structured feedback "
+                "and return a complete replacement JSON object matching the schema.\n"
+                "# Automatic retry feedback (JSON)\n"
+                + json.dumps(retry_feedback, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            )
         metadata = {"batch_id": batch_id, "node_id": "code"}
         try:
-            return self.llm.generate_json(system=prompt, user=user, schema=CodeGenerationResult, metadata=metadata)
+            result = self.llm.generate_json(system=prompt, user=user, schema=CodeGenerationResult, metadata=metadata)
         except Exception:
             if self._strict_mode():
                 raise
-            return self._template_generation_result()
+            design = json.loads(manifest)
+            from app.agents.fallback import generic_code
+            result = CodeGenerationResult.model_validate(generic_code(design))
+
+        if frontend_required and not any(file.path == "frontend/index.html" for file in result.files):
+            raise ValueError("Generated application is missing required frontend/index.html")
+        return result
 
     def _strict_mode(self) -> bool:
         adapter_settings = getattr(self.llm, "settings", None)
@@ -784,6 +277,8 @@ class CodeAgent(BaseAgent):
         return path.read_text(encoding="utf-8")
 
     def _safe_generated_path(self, generated_path: str, base_dir: Path | None = None) -> Path:
+        if "\\" in generated_path:
+            raise ValueError("Generated paths must use POSIX separators")
         candidate = Path(generated_path)
         if candidate.is_absolute():
             raise ValueError(f"Generated path must be relative: {generated_path}")
@@ -793,6 +288,8 @@ class CodeAgent(BaseAgent):
             raise ValueError(f"Generated path must be under src/ or frontend/: {generated_path}")
         root = base_dir or self.store.root_dir
         target = (root / candidate).resolve()
+        if not target.is_relative_to(root.resolve()):
+            raise ValueError("Generated path escapes application root")
         allowed_root = (root / candidate.parts[0]).resolve()
         if target != allowed_root and allowed_root not in target.parents:
             raise ValueError(f"Generated path escapes {candidate.parts[0]}/: {generated_path}")
@@ -810,20 +307,21 @@ class CodeAgent(BaseAgent):
         lines = [
             f"# {name}",
             "",
-            "> 由 AI Agent 开发流水线自动生成。批次 ID: `{batch_id}`",
+            f"> 由 AI Agent 开发流水线自动生成。批次 ID: `{batch_id}`",
+            f"> 生成方式：{manifest.get('strategy', 'unknown')}" + (f" ({manifest['sample_fixture']} 确定性示例；不代表任意规格自动实现)" if manifest.get('sample_fixture') else ""),
             "",
             "## 快速启动",
             "",
             "```bash",
-            "pip install fastapi uvicorn pydantic",
+            "pip install -r requirements.txt",
             f"{backend_cmd}",
             "```",
             "",
-            "后端文档：http://127.0.0.1:8000/docs",
+            "后端文档：访问启动命令对应的端口下的 /docs。",
             "",
         ]
         if has_frontend:
-            lines += ["## 前端", "", "直接用浏览器打开 `frontend/index.html`，无需额外服务。", ""]
+            lines += ["## 前端", "", "按 `code_manifest.json` 的运行指令访问前端。离线模板由后端同源提供，默认 http://127.0.0.1:8001 。", ""]
         lines += [
             "## 运行测试",
             "",
@@ -842,8 +340,8 @@ class CodeAgent(BaseAgent):
         return "\n".join(lines)
 
     def _code_manifest(self, result: CodeGenerationResult) -> dict[str, object]:
-        manifest: dict[str, object] = {"strategy": "llm-structured-generation"}
-        manifest.update(result.manifest)
+        manifest: dict[str, object] = result.manifest.model_dump(exclude_none=True)
+        manifest.setdefault("strategy", "llm-structured-generation")
         manifest["source_root"] = "src"
         manifest["modules"] = sorted(file.path for file in result.files)
         manifest.setdefault("entrypoint", "uvicorn src.api:app --reload")
@@ -856,46 +354,3 @@ class CodeAgent(BaseAgent):
                 ["uvicorn src.api:app --reload", "open frontend/index.html in a browser"],
             )
         return manifest
-
-    def _template_generation_result(self) -> CodeGenerationResult:
-        return CodeGenerationResult(
-            files=[
-                GeneratedCodeFile(path=f"src/{relative_path}", content=dedent(content).lstrip("\n"))
-                for relative_path, content in BUSINESS_FILES.items()
-            ]
-            + [
-                GeneratedCodeFile(path=f"frontend/{relative_path}", content=dedent(content).lstrip("\n"))
-                for relative_path, content in FRONTEND_FILES.items()
-            ],
-            manifest={
-                "system_name": "Employee Temporary Vehicle Reservation System",
-                "strategy": "template-fallback",
-                "business_functions": ["campus configuration", "reservation", "cancellation", "advance payment", "query"],
-                "csv_tables": [
-                    "campus_configs.csv",
-                    "reservations.csv",
-                    "ketuo_reservation_archive.csv",
-                    "payment_records.csv",
-                    "internal_vehicle_archive.csv",
-                ],
-                "frontend_pages": [
-                    {
-                        "path": "frontend/index.html",
-                        "name": "员工临时车辆预约管理页面",
-                        "purpose": "员工提交预约、查看预约、取消预约、提前缴费，管理员查看园区配置与配额",
-                        "controls": [
-                            "reservation form",
-                            "campus selector",
-                            "reservation table",
-                            "cancel button",
-                            "prepay button",
-                            "campus configuration table",
-                        ],
-                    }
-                ],
-                "run_instructions": [
-                    "uvicorn src.api:app --reload",
-                    "open frontend/index.html in a browser",
-                ],
-            },
-        )

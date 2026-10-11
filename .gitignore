@@ -104,3 +104,7 @@ node_modules/
 .codex/
 .cursor/
 .claude/
+
+# Local scratch work and uploaded runtime specification copies
+work/
+docs/待生成/????????_??????_*
