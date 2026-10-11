@@ -946,6 +946,7 @@ def code_result(system_name: str) -> CodeGenerationResult:
         manifest={
             "system_name": "Employee Temporary Vehicle Reservation System",
             "strategy": "sample-fixture",
+            "entrypoint": "python -m uvicorn src.api:app --port 8001",
             "limitations": ["No employee/admin authentication in offline template", "Calendar uses weekends, not statutory holiday calendars", "CSV is intended for single-process local demos"],
             "storage_contract": {"module": "src.api", "service_attribute": "service", "factory": "src.services.ReservationService", "argument": "data_dir"},
             "api_routes": [{"method": method, "path": path} for method, path in [
@@ -982,8 +983,8 @@ def code_result(system_name: str) -> CodeGenerationResult:
         },
     )
 
-    result.manifest["system_name"] = system_name
-    result.manifest["sample_fixture"] = SAMPLE_FIXTURE_ID
+    result.manifest.system_name = system_name
+    result.manifest.sample_fixture = SAMPLE_FIXTURE_ID
     for file in result.files:
         if file.path == "src/api.py":
             file.content = file.content.replace('title="Employee Temporary Vehicle Reservation System"', "title=" + repr(system_name))

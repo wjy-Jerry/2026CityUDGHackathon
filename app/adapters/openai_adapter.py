@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from json import JSONDecodeError
 from typing import Any
 
@@ -79,14 +80,16 @@ class OpenAIAdapter:
             )
             return response.output_text
         except Exception as exc:
+            safe_error = self._safe_exception_summary(exc)
             if self.settings.llm_strict:
-                raise LLMError(f"OpenAI text generation failed: {exc.__class__.__name__}: {exc}") from exc
+                raise LLMError(f"OpenAI text generation failed: {safe_error}") from exc
             try:
-                self._mark_fallback(f"{exc.__class__.__name__}: {exc}")
+                self._mark_fallback(safe_error)
                 return self.fallback.generate_text(system=system, user=user, metadata=metadata)
             except Exception as fallback_exc:
                 raise LLMError(
-                    f"OpenAI text generation failed and fallback failed: {exc.__class__.__name__}: {fallback_exc}"
+                    f"OpenAI text generation failed and fallback failed: {safe_error}; "
+                    f"{self._safe_exception_summary(fallback_exc)}"
                 ) from fallback_exc
 
     def generate_json(
@@ -106,7 +109,14 @@ class OpenAIAdapter:
             return self.fallback.generate_json(system=system, user=user, schema=schema, metadata=metadata)
         try:
             if self._use_chat_completions:
-                return self._generate_chat_json(model=model, system=system, user=user, schema=schema)
+                code_limit = self.settings.code_max_output_tokens if (metadata or {}).get("node_id") == "code" else None
+                return self._generate_chat_json(
+                    model=model,
+                    system=system,
+                    user=user,
+                    schema=schema,
+                    max_output_tokens=code_limit,
+                )
             response = self._client.responses.create(
                 model=model,
                 input=[
@@ -118,14 +128,16 @@ class OpenAIAdapter:
             )
             return schema.model_validate(json.loads(response.output_text))
         except Exception as exc:
+            safe_error = self._safe_exception_summary(exc)
             if self.settings.llm_strict:
-                raise LLMError(f"OpenAI JSON generation failed: {exc.__class__.__name__}: {exc}") from exc
+                raise LLMError(f"OpenAI JSON generation failed: {safe_error}") from exc
             try:
-                self._mark_fallback(f"{exc.__class__.__name__}: {exc}")
+                self._mark_fallback(safe_error)
                 return self.fallback.generate_json(system=system, user=user, schema=schema, metadata=metadata)
             except Exception as fallback_exc:
                 raise LLMError(
-                    f"OpenAI JSON generation failed and fallback failed: {exc.__class__.__name__}: {fallback_exc}"
+                    f"OpenAI JSON generation failed and fallback failed: {safe_error}; "
+                    f"{self._safe_exception_summary(fallback_exc)}"
                 ) from fallback_exc
 
     @property
@@ -133,12 +145,70 @@ class OpenAIAdapter:
         return bool(self.settings.openai_base_url)
 
     def _chat_content(self, response: Any) -> str:
-        content = response.choices[0].message.content
+        self._record_chat_response_metadata(response)
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            raise LLMError("Chat completion returned no choices")
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
         if not content:
-            raise LLMError("Chat completion returned empty content")
+            finish_reason = self._last_call_metadata.get("llm_finish_reason") or "unknown"
+            refusal = bool(getattr(message, "refusal", None))
+            raise LLMError(
+                f"Chat completion returned empty content (finish_reason={finish_reason}, "
+                f"refusal_present={str(refusal).lower()})"
+            )
         return content
 
-    def _generate_chat_json(self, *, model: str, system: str, user: str, schema: type[SchemaT]) -> SchemaT:
+    def _record_chat_response_metadata(self, response: Any) -> None:
+        choices = getattr(response, "choices", None) or []
+        choice = choices[0] if choices else None
+        message = getattr(choice, "message", None)
+        values = {
+            "llm_response_id": getattr(response, "id", None),
+            "llm_response_model": getattr(response, "model", None),
+            "llm_finish_reason": getattr(choice, "finish_reason", None),
+            "llm_refusal_present": bool(getattr(message, "refusal", None)),
+        }
+        usage = getattr(response, "usage", None)
+        for source, target in (("prompt_tokens", "llm_prompt_count"),
+                               ("completion_tokens", "llm_completion_count"),
+                               ("total_tokens", "llm_total_count")):
+            count = getattr(usage, source, None)
+            if count is not None:
+                values[target] = count
+        self._last_call_metadata.update({key: value for key, value in values.items() if value is not None})
+
+    def _validation_error_summary(self, exc: Exception) -> list[dict[str, str]]:
+        if isinstance(exc, ValidationError):
+            errors = exc.errors(include_input=False)
+            return [
+                {
+                    "path": ".".join(str(part) for part in error.get("loc", ())) or "response",
+                    "type": str(error.get("type", "validation_error")),
+                    "message": str(error.get("msg", "Invalid value"))[:240],
+                }
+                for error in errors[:8]
+            ]
+        return [{"path": "response", "type": "invalid_json", "message": "Response was not valid JSON."}]
+
+    def _safe_exception_summary(self, exc: Exception) -> str:
+        message = str(exc)
+        secret = self.settings.openai_api_key
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+        message = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [REDACTED]", message)
+        return f"{exc.__class__.__name__}: {message[:1200]}"
+
+    def _generate_chat_json(
+        self,
+        *,
+        model: str,
+        system: str,
+        user: str,
+        schema: type[SchemaT],
+        max_output_tokens: int | None = None,
+    ) -> SchemaT:
         schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False)
         messages = [
             {
@@ -155,18 +225,24 @@ class OpenAIAdapter:
         last_content = ""
         last_error: Exception | None = None
         for attempt in range(2):
-            response = self._client.chat.completions.create(
-                model=model,
-                messages=messages,
-                response_format={"type": "json_object"},
-            )
+            request: dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "response_format": {"type": "json_object"},
+            }
+            if max_output_tokens is not None:
+                request["max_tokens"] = max_output_tokens
+            response = self._client.chat.completions.create(**request)
             last_content = self._chat_content(response)
             try:
                 return schema.model_validate(json.loads(last_content))
             except (JSONDecodeError, ValidationError) as exc:
                 last_error = exc
+                feedback = self._validation_error_summary(exc)
+                self._last_call_metadata["llm_validation_errors"] = feedback
                 if attempt == 1:
                     break
+                feedback_json = json.dumps(feedback, ensure_ascii=False, sort_keys=True)
                 messages.extend(
                     [
                         {"role": "assistant", "content": last_content[:12000]},
@@ -174,7 +250,7 @@ class OpenAIAdapter:
                             "role": "user",
                             "content": (
                                 "The previous JSON failed validation. Return a corrected JSON object only.\n"
-                                f"Validation error:\n{exc}\n\n"
+                                f"Structured validation feedback:\n{feedback_json}\n\n"
                                 "Follow the supplied schema exactly. Preserve all required fields and complete file contents."
 
                             ),

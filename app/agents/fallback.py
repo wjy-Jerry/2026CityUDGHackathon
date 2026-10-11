@@ -185,6 +185,7 @@ def generic_code(manifest: dict) -> dict:
         files += [{'path':'frontend/index.html','content':GENERIC_HTML.replace('TITLE', escape(name))},
                   {'path':'frontend/app.js','content':GENERIC_JS}]
     return {'files':files, 'manifest':{'system_name':name,'strategy':'generic-template-fallback',
+                                      'entrypoint':'python -m uvicorn src.api:app --port 8001',
                                       'api_routes':[{'path':r.split()[1], 'method':r.split()[0]} for r in manifest['api_endpoints']],
                                       'storage_contract':{'module':'src.api','service_attribute':'service','factory':'src.services.RecordService','argument':'data_dir'},
                                       'limitations':['Offline generic CRUD template; domain-specific requirements need LLM mode'],

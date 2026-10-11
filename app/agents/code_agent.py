@@ -3,8 +3,9 @@ from __future__ import annotations
 import shutil
 import json
 from pathlib import Path
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.agents.base import BaseAgent
 
@@ -13,6 +14,8 @@ from app.agents.base import BaseAgent
 
 
 class GeneratedCodeFile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     path: str = Field(
         pattern=r"^(src/.+\.py|frontend/.+\.(html|css|js))$",
         description="Project-relative backend Python path under src/ or static frontend path under frontend/",
@@ -20,19 +23,124 @@ class GeneratedCodeFile(BaseModel):
     content: str = Field(min_length=1, description="Complete file contents")
 
 
+class CodeManifestField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    type: str = Field(min_length=1)
+    description: str = ""
+
+
+class CodeManifestRoute(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, pattern=r"^/")
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+    summary: str = ""
+    request_fields: list[CodeManifestField] = Field(default_factory=list)
+    response_fields: list[CodeManifestField] = Field(default_factory=list)
+    error_cases: list[str] = Field(default_factory=list)
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def normalize_method(cls, value: object) -> object:
+        return value.upper() if isinstance(value, str) else value
+
+
+class CodeManifestDataModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    fields: list[CodeManifestField] = Field(default_factory=list)
+
+
+class CodeManifestFrontendPage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    purpose: str = Field(min_length=1)
+    controls: list[str] = Field(default_factory=list)
+
+
+class CodeManifestStorageContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    module: str = Field(min_length=1, pattern=r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
+    service_attribute: str = Field(min_length=1, pattern=r"^[A-Za-z_]\w*$")
+    factory: str = Field(min_length=3, pattern=r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$")
+    argument: str = Field(min_length=1, pattern=r"^[A-Za-z_]\w*$")
+
+
+class CodeManifest(BaseModel):
+    """Validated contract persisted for application verification and TestAgent."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    system_name: str = Field(min_length=1)
+    entrypoint: str = Field(min_length=1)
+    api_routes: list[CodeManifestRoute] = Field(min_length=1)
+    data_models: list[CodeManifestDataModel] = Field(default_factory=list)
+    business_rules: list[str] = Field(default_factory=list)
+    business_functions: list[str] = Field(default_factory=list)
+    csv_tables: list[str] = Field(default_factory=list)
+    frontend_pages: list[CodeManifestFrontendPage] = Field(default_factory=list)
+    storage_contract: CodeManifestStorageContract
+    run_instructions: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    strategy: str | None = None
+    sample_fixture: str | None = None
+    source_root: Literal["src"] = "src"
+    modules: list[str] = Field(default_factory=list)
+    frontend_root: str | None = None
+    frontend_files: list[str] = Field(default_factory=list)
+
+    @field_validator("entrypoint")
+    @classmethod
+    def require_fastapi_entrypoint(cls, value: str) -> str:
+        if "src.api:app" not in value.split():
+            raise ValueError("Manifest entrypoint must reference src.api:app")
+        return value
+
+    @model_validator(mode="after")
+    def require_unique_routes(self) -> "CodeManifest":
+        routes = [(route.method, route.path) for route in self.api_routes]
+        if len(routes) != len(set(routes)):
+            raise ValueError("Manifest api_routes must not contain duplicate method/path pairs")
+        return self
+
+
 class CodeGenerationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     files: list[GeneratedCodeFile] = Field(min_length=1)
-    manifest: dict[str, object] = Field(default_factory=dict)
+    manifest: CodeManifest
+
+    @model_validator(mode="after")
+    def validate_file_set(self) -> "CodeGenerationResult":
+        paths = [file.path for file in self.files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("Generated files must not contain duplicate paths")
+        missing = {"src/__init__.py", "src/api.py"} - set(paths)
+        if missing:
+            raise ValueError(f"Generated code is missing required files: {sorted(missing)}")
+        if self.manifest.frontend_pages and "frontend/index.html" not in paths:
+            raise ValueError("Manifest frontend_pages requires frontend/index.html")
+        return self
 
 
 class CodeAgent(BaseAgent):
     agent_name = "CodeAgent"
     prompt_file = "code_agent.md"
 
-    def run(self, input_context: dict[str, str]) -> list[object]:
+    def run(self, input_context: dict[str, Any]) -> list[object]:
         batch_id = input_context["batch_id"]
         spec_path = input_context["spec_path"]
-        result = self._generate_code(batch_id=batch_id, spec_path=spec_path)
+        result = self._generate_code(
+            batch_id=batch_id,
+            spec_path=spec_path,
+            retry_feedback=input_context.get("retry_feedback"),
+        )
 
         out_root = self.store.output_batch_dir(batch_id)
         src_dir = out_root / "src"
@@ -78,7 +186,13 @@ class CodeAgent(BaseAgent):
 
         return [manifest_ref, *written_refs, *snapshot_refs, *frontend_snapshot_refs]
 
-    def _generate_code(self, *, batch_id: str, spec_path: str) -> CodeGenerationResult:
+    def _generate_code(
+        self,
+        *,
+        batch_id: str,
+        spec_path: str,
+        retry_feedback: dict[str, Any] | None = None,
+    ) -> CodeGenerationResult:
         from app.demo_fixtures import SAMPLE_FIXTURE_ID
         if self.store.load_state(batch_id).sample_fixture == SAMPLE_FIXTURE_ID:
             from app.demo_fixtures.vehicle_reservations import code_result
@@ -121,6 +235,7 @@ class CodeAgent(BaseAgent):
             "  csv_tables: 所有 CSV 存储文件名列表\n"
             "  frontend_pages: [{path, name, purpose, controls:[str]}]，每个页面一条\n"
             "  storage_contract: {module, service_attribute, factory, argument}; factory accepts data_dir for isolated tests\n"
+            "  entrypoint: complete command containing the exact target src.api:app\n"
             "  run_instructions: 本地启动所需的完整命令和 URL 列表\n\n"
             f"# 产品规格说明书（背景参考）\n{spec_text}\n\n"
             f"# 概要设计文档（主要权威输入）\n{overview}\n\n"
@@ -129,15 +244,27 @@ class CodeAgent(BaseAgent):
         repair = self.store.batch_dir(batch_id) / "repair_report.json"
         if repair.is_file():
             user += "\n# Structured repair feedback\n" + repair.read_text(encoding="utf-8")
+        if retry_feedback:
+            user += (
+                "\nThe previous attempt failed validation. Correct the issues in this structured feedback "
+                "and return a complete replacement JSON object matching the schema.\n"
+                "# Automatic retry feedback (JSON)\n"
+                + json.dumps(retry_feedback, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            )
         metadata = {"batch_id": batch_id, "node_id": "code"}
         try:
-            return self.llm.generate_json(system=prompt, user=user, schema=CodeGenerationResult, metadata=metadata)
+            result = self.llm.generate_json(system=prompt, user=user, schema=CodeGenerationResult, metadata=metadata)
         except Exception:
             if self._strict_mode():
                 raise
             design = json.loads(manifest)
             from app.agents.fallback import generic_code
-            return CodeGenerationResult.model_validate(generic_code(design))
+            result = CodeGenerationResult.model_validate(generic_code(design))
+
+        if frontend_required and not any(file.path == "frontend/index.html" for file in result.files):
+            raise ValueError("Generated application is missing required frontend/index.html")
+        return result
 
     def _strict_mode(self) -> bool:
         adapter_settings = getattr(self.llm, "settings", None)
@@ -213,8 +340,8 @@ class CodeAgent(BaseAgent):
         return "\n".join(lines)
 
     def _code_manifest(self, result: CodeGenerationResult) -> dict[str, object]:
-        manifest: dict[str, object] = {"strategy": "llm-structured-generation"}
-        manifest.update(result.manifest)
+        manifest: dict[str, object] = result.manifest.model_dump(exclude_none=True)
+        manifest.setdefault("strategy", "llm-structured-generation")
         manifest["source_root"] = "src"
         manifest["modules"] = sorted(file.path for file in result.files)
         manifest.setdefault("entrypoint", "uvicorn src.api:app --reload")

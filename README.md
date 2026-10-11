@@ -64,10 +64,13 @@ python -m pip check
 | `OPENAI_API_KEY` | 仅放在环境或本地 `.env`，不要提交到仓库 |
 | `OPENAI_BASE_URL` | 可选 OpenAI 兼容地址；留空使用 SDK Responses API，配置后使用 Chat Completions |
 | `DESIGN_MODEL` / `CODE_MODEL` / `TEST_MODEL` | 真实模式必须填写账户支持的模型名 |
+| `CODE_MAX_OUTPUT_TOKENS` | 可选代码输出预算，必须不超过所选模型的输出限制；未设置时使用 provider 默认值 |
 | `LLM_STRICT` | 未设置时，无 Key 默认 false，有 Key 默认 true；false 允许设计/代码降级为离线模板 |
 | `MAX_RETRIES` | 自动重试次数，默认 2，即最多初次执行 + 2 次重试；负数按 0 处理 |
 
 LLM 单次请求超时 60 秒，SDK 最多额外重试一次。LLM 生成的代码无法配套生成测试时，会明确失败，不套用不相关的车辆测试或静默使用共享数据库。
+
+OpenRouter 使用 JSON object 响应模式，并由 Pydantic 验证完整结果。`openrouter/free` 会在免费模型间路由；各模型的 JSON 支持、上下文和输出上限可能不同。需要稳定生成完整应用时，将 `CODE_MODEL` 设为 OpenRouter 当前目录中明确支持 `response_format` JSON mode、且有充足输出预算的具体 `:free` 模型 slug；可用 `CODE_MAX_OUTPUT_TOKENS` 显式设置不超过其文档上限的输出预算。当前兼容配置示例：`CODE_MODEL=nvidia/nemotron-3-super-120b-a12b:free`、`CODE_MAX_OUTPUT_TOKENS=16384`。免费目录会变化，使用前应核对模型目录中的 `supported_parameters` 与 `top_provider.max_completion_tokens`，不要把路由别名当作固定模型。
 
 ## 启动平台
 

@@ -10,7 +10,9 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
+from pydantic import ValidationError as PydanticValidationError
 
+from app.agents.code_agent import CodeManifest
 from app.agents.design_agent import DesignManifest
 from app.storage.file_store import FileStore
 
@@ -148,6 +150,31 @@ class CodeValidator:
             html = frontend.read_text(encoding="utf-8").lower()
             if not all(re.search(r"<" + marker + r"\b", html) for marker in ("form", "button")):
                 raise ValidationError("frontend/index.html requires form and button elements")
+        manifest_path = root / "code_manifest.json"
+        if not manifest_path.is_file():
+            raise ValidationError("code_manifest.json is required")
+        try:
+            manifest = self.store.read_json(manifest_path)
+            CodeManifest.model_validate(manifest)
+        except (PydanticValidationError, ValueError, TypeError) as exc:
+            if isinstance(exc, PydanticValidationError):
+                problems = [
+                    f"{'.'.join(str(part) for part in error['loc']) or 'manifest'}: {error['msg']}"
+                    for error in exc.errors(include_input=False)[:8]
+                ]
+                details = "; ".join(problems)
+            else:
+                details = str(exc)
+            message = f"Invalid code_manifest.json: {details[:1200]}"
+            raise ValidationError(
+                message,
+                {
+                    "validator": "code",
+                    "passed": False,
+                    "summary": message,
+                    "checks": {"manifest_schema_valid": False},
+                },
+            ) from exc
         with tempfile.TemporaryDirectory(prefix="pipeline-smoke-") as temp:
             target = Path(temp) / "application"
             _copy_application(root, target)

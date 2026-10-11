@@ -197,13 +197,15 @@ class Orchestrator:
         return state
 
     def _execute_node_with_retries(self, state: BatchState, node_id: NodeId) -> BatchState:
+        retry_feedback = None
         while True:
-            state = self._execute_node_once(state, node_id)
+            state = self._execute_node_once(state, node_id, retry_feedback=retry_feedback)
             node = state.nodes[node_id]
             if node.status == "succeeded":
                 return state
             if node.retries >= self.max_retries:
                 return state
+            retry_feedback = self._automatic_retry_feedback(node_id, node)
             node.retries += 1
             node.status = "queued"
             self.store.save_state(state)
@@ -216,7 +218,13 @@ class Orchestrator:
                 retry_index=node.retries,
             )
 
-    def _execute_node_once(self, state: BatchState, node_id: NodeId) -> BatchState:
+    def _execute_node_once(
+        self,
+        state: BatchState,
+        node_id: NodeId,
+        *,
+        retry_feedback: dict[str, object] | None = None,
+    ) -> BatchState:
         node = state.nodes[node_id]
         node.status = "running"
         node.started_at = now_iso()
@@ -237,7 +245,12 @@ class Orchestrator:
         started = time.perf_counter()
         try:
             node.inputs = self._inputs_for(state, node_id)
-            outputs = self._agent_for(node_id).run({"batch_id": state.batch_id, "spec_path": state.spec_path, "sample_fixture": state.sample_fixture or ""})
+            outputs = self._agent_for(node_id).run({
+                "batch_id": state.batch_id,
+                "spec_path": state.spec_path,
+                "sample_fixture": state.sample_fixture or "",
+                "retry_feedback": retry_feedback if node_id == "code" else None,
+            })
             node.outputs = [output for output in outputs if isinstance(output, ArtifactRef)]
             node.quality_check_result = self._validator_for(node_id).validate(state.batch_id)
             node.status = "succeeded"
@@ -276,6 +289,49 @@ class Orchestrator:
                 metadata=self._llm_metadata_for(node_id),
             )
             return state
+
+    def _automatic_retry_feedback(self, node_id: NodeId, node) -> dict[str, object]:
+        """Build small, credential-free feedback for the next CodeAgent attempt."""
+        quality = node.quality_check_result or {}
+        summary = quality.get("summary")
+        failed_checks = [
+            name for name, passed in (quality.get("checks") or {}).items()
+            if passed is False
+        ]
+        metadata = self._llm_metadata_for(node_id)
+        schema_errors = metadata.get("llm_validation_errors") or []
+        message = (node.error_message or "").lower()
+        if summary:
+            category = "quality_validation"
+            safe_summary = str(summary)[:1200]
+        elif schema_errors:
+            category = "schema_validation"
+            safe_summary = "The previous JSON did not match the requested Pydantic schema."
+        elif "missing required frontend/index.html" in message:
+            category = "artifact_validation"
+            safe_summary = "Generated output is missing required frontend/index.html. Include the complete page and its referenced assets."
+        elif "empty content" in message:
+            category = "empty_model_response"
+            safe_summary = "The previous model response contained no usable content. Return a complete JSON object."
+        else:
+            category = "generation_failure"
+            safe_summary = "The previous generation attempt failed. Return one complete JSON object matching the schema."
+        feedback: dict[str, object] = {
+            "attempt": node.retries + 1,
+            "category": category,
+            "summary": safe_summary,
+            "instruction": "Correct every listed issue and return one complete replacement object matching the requested schema.",
+        }
+        if failed_checks:
+            feedback["failed_checks"] = failed_checks[:12]
+        if schema_errors:
+            feedback["schema_errors"] = schema_errors[:8]
+        for source, target in (("llm_model", "model"), ("llm_response_model", "response_model"),
+                               ("llm_finish_reason", "finish_reason")):
+            value = metadata.get(source)
+            if value:
+                feedback[target] = value
+        return feedback
 
     def _save_quality_summary(self, state):
         report = {nid: state.nodes[nid].quality_check_result for nid in NODE_ORDER}
